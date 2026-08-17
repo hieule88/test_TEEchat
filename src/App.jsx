@@ -1,4 +1,4 @@
-import React, { useState, useCallback } from 'react';
+import React, { useState, useCallback, useRef } from 'react';
 import { aci, AciError, MAX_SPEND_MC } from './aci';
 
 // React escapes all interpolated text ({value}) by default, so server-provided
@@ -34,6 +34,12 @@ export default function App() {
   const [prompt, setPrompt] = useState('');
   const [credits, setCredits] = useState(300);
   const [busy, setBusy] = useState(false);
+
+  // The conversation sent to the model, in OpenAI format. LLMs are stateless —
+  // to have memory we must send the WHOLE history every request. Kept across
+  // logout so re-opening a session continues the same conversation (in tab
+  // memory only; closing the tab clears it).
+  const historyRef = useRef([]);
 
   const sync = useCallback(() => {
     setAccount(aci.account);
@@ -82,11 +88,13 @@ export default function App() {
     setPrompt('');
     setMessages((m) => [...m, { role: 'user', text }, { role: 'ai', text: '…', pending: true }]);
     setBusy(true);
+    // Send the WHOLE conversation so the model has context.
+    const outgoing = [...historyRef.current, { role: 'user', content: text }];
     try {
-      const { content, receiptId } = await aci.chat({
-        model,
-        messages: [{ role: 'user', content: text }],
-      });
+      const { content, receiptId } = await aci.chat({ model, messages: outgoing });
+      // Commit both turns to history only on success (a failed turn is dropped
+      // so it doesn't poison later context).
+      historyRef.current = [...outgoing, { role: 'assistant', content: content ?? '' }];
       setMessages((m) => {
         const copy = [...m];
         copy[copy.length - 1] = { role: 'ai', text: content ?? '(empty response)', receiptId };
@@ -127,6 +135,11 @@ export default function App() {
     notify('ok', 'Logged out');
   }, [notify, sync]);
 
+  const onNewChat = useCallback(() => {
+    historyRef.current = [];
+    setMessages([{ role: 'ai', text: 'New conversation — previous context cleared.' }]);
+  }, []);
+
   const verifyReceipt = useCallback(async (id) => {
     try {
       const r = await aci.getReceipt(id);
@@ -151,6 +164,7 @@ export default function App() {
             {connected ? 'Open session' : 'Connect wallet'}
           </button>
         )}
+        {inSession && <button className="ghost" onClick={onNewChat}>New chat</button>}
         {inSession && <button className="ghost" onClick={onLogout}>Log out</button>}
       </header>
 
