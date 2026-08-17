@@ -239,11 +239,21 @@ export class LeviathanACI {
 
   /**
    * Convenience chat call (OpenAI-compatible, non-streaming).
+   *
+   * Streaming is NOT supported here: this method reads the reply as one JSON
+   * document, which is incompatible with SSE. Passing `stream: true` throws
+   * up front (a typed, self-explanatory error) instead of letting res.json()
+   * die on the SSE bytes. If you need streaming, call signedFetch() yourself
+   * and parse the `data:` chunks.
    * @returns {Promise<{content: string, receiptId: string|null, raw: object}>}
    */
-  async chat({ model, messages, stream = false, ...rest }) {
+  async chat({ model, messages, stream, ...rest }) {
+    if (stream) {
+      throw new AciError('config',
+        'streaming is not supported by chat() — use signedFetch() and parse the SSE yourself');
+    }
     const res = await this.signedFetch('/v1/chat/completions',
-      { body: JSON.stringify({ model, messages, stream, ...rest }) });
+      { body: JSON.stringify({ model, messages, ...rest }) });
     if (!res.ok) throw await toError(res);
     const raw = await res.json();
     return {
