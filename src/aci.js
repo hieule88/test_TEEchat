@@ -9,8 +9,8 @@ export const aci = new LeviathanACI({
     import.meta.env.VITE_EDGE_ORIGIN ?? 'https://leviathan-edge-test.duckdns.org:8443',
 });
 
-// Session spend cap the user authorizes when opening a session (shown before
-// the Falcon popup).
-export const MAX_SPEND_MC = 100_000;
+// Session spend cap (in credits — 1 credit = 1 chat) the user authorizes when
+// opening a session (shown before the Falcon popup).
+export const MAX_SPEND = 100;
 
 export { AciError };

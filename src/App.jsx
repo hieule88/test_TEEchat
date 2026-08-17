@@ -1,5 +1,5 @@
 import React, { useState, useCallback, useRef } from 'react';
-import { aci, AciError, MAX_SPEND_MC } from './aci';
+import { aci, AciError, MAX_SPEND } from './aci';
 
 // React escapes all interpolated text ({value}) by default, so server-provided
 // strings (model ids, error messages, receipts) can never inject markup.
@@ -67,11 +67,11 @@ export default function App() {
         const a = await aci.connect();
         notify('ok', `Wallet connected · ${short(a.address || a.publicKeyHex)}`);
       } else {
-        const s = await aci.openSession({ maxSpendMc: MAX_SPEND_MC });
+        const s = await aci.openSession({ maxSpend: MAX_SPEND });
         if (s.warning) notify('warn', s.warning);
-        else notify('ok', `Session open · you authorized up to ${s.maxSpendMc} mc`);
+        else notify('ok', `Session open · you authorized up to ${s.maxSpend} credits`);
         await loadModels();
-        if (!s.balanceMc) notify('warn', 'New account, balance 0 — top up on the right to chat.');
+        if (!s.balance) notify('warn', 'New account, balance 0 — top up on the right to chat.');
       }
     } catch (e) {
       notify('err', explain(e));
@@ -214,7 +214,7 @@ export default function App() {
           <div>
             <h3>Balance</h3>
             <div className="card">
-              <div className="balance">{session?.balanceMc ?? '—'} <span className="unit">mc</span></div>
+              <div className="balance">{session?.balance ?? '—'} <span className="unit">credits</span></div>
               <div className="row" style={{ marginTop: 10 }}>
                 <button className="ghost" onClick={onRefresh} disabled={!inSession}>↻ Refresh</button>
               </div>

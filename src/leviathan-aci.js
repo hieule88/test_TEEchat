@@ -49,7 +49,7 @@ const GOLDILOCKS_P = (1n << 64n) - (1n << 32n) + 1n; // Leviathan field prime
 
 const DEFAULTS = Object.freeze({
   scope: ['inference', 'receipts', 'models'],
-  maxSpendMc: 100_000,   // millicredits the session may spend before re-auth
+  maxSpend: 100,         // credits the session may spend before re-auth (1 credit = 1 request)
   ttlSec: 12 * 60 * 60,  // session lifetime; the Edge caps this (≤24h)
 });
 
@@ -145,7 +145,7 @@ export class LeviathanACI {
     const s = this._session;
     return s && {
       sessionId: s.session_id, identityId: s.identity_id, expiresAt: s.expires_at,
-      scope: s.scope, maxSpendMc: s.max_spend_mc, balanceMc: s.balance_mc ?? null,
+      scope: s.scope, maxSpend: s.max_spend, balance: s.balance ?? null,
       warning: s.warning ?? null,
     };
   }
@@ -168,7 +168,7 @@ export class LeviathanACI {
    *
    * @param {object} [grant]
    * @param {string[]} [grant.scope]      default ['inference','receipts','models']
-   * @param {number}   [grant.maxSpendMc] default 100000 — the spend cap the USER signs
+   * @param {number}   [grant.maxSpend]   default 100 — the spend cap (credits) the USER signs
    * @param {number}   [grant.ttlSec]     default 12h (Edge caps ≤24h)
    * @param {string|null} [grant.accountId] optional bech32 Leviathan address label (unverified)
    * @returns {Promise<object>} the public session info (see `.session`)
@@ -197,7 +197,7 @@ export class LeviathanACI {
       wallet_pub_key: this._account.publicKeyHex,
       account_id: grant.accountId ?? null,
       session_pub_key: this._keys.signPubHex, e2ee_pub_key: this._keys.e2eePubHex,
-      scope: g.scope, max_spend_mc: Math.max(1, Math.floor(g.maxSpendMc)),
+      scope: g.scope, max_spend: Math.max(1, Math.floor(g.maxSpend)),
     };
 
     // 4. Falcon-sign inside the wallet (user approves the popup)
@@ -282,16 +282,16 @@ export class LeviathanACI {
 
   /**
    * Refresh the credit balance for the current session — one signed GET, no
-   * Falcon popup, no re-bind. Updates `.session.balanceMc` and returns it.
+   * Falcon popup, no re-bind. Updates `.session.balance` and returns it.
    * Call this after a top-up instead of reloading the page.
-   * @returns {Promise<number>} current balance in millicredits
+   * @returns {Promise<number>} current balance in credits
    */
   async refreshBalance() {
     const res = await this.signedFetch('/v1/wallet/balance', { method: 'GET' });
     if (!res.ok) throw await toError(res);
     const j = await res.json();
-    if (this._session) this._session.balance_mc = j.balance_mc; // keep .session in sync
-    return j.balance_mc;
+    if (this._session) this._session.balance = j.balance; // keep .session in sync
+    return j.balance;
   }
 
   /** List models (no debit). */

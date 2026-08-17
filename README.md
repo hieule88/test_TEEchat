@@ -39,7 +39,7 @@ npm run dev            # http://localhost:5173
    });
    ```
 3. **Wallet login + chat** — `src/App.jsx` calls `aci.connect()`,
-   `aci.openSession({ maxSpendMc })`, then `aci.chat(...)`, plus balance
+   `aci.openSession({ maxSpend })`, then `aci.chat(...)`, plus balance
    refresh, NOWPayments top-up, receipt verify, and logout.
 
 ## Prerequisites (from the operator)
