@@ -108,10 +108,17 @@ export default function App() {
         : null;
       // Commit both turns to history only on success (a failed turn is dropped
       // so it doesn't poison later context).
+      // Rare upstream quirk: on obscure topics the model can spend all its
+      // server-side search rounds and get cut off before composing an answer
+      // (empty content, queries disclosed). Tell the user what happened.
+      const text = content
+        || (webSearches?.length
+          ? '⚠ Model dùng hết lượt web search mà chưa kịp tổng hợp câu trả lời. Hãy hỏi lại cụ thể hơn (ví dụ kèm tên miền/từ khóa chính xác) — các truy vấn đã search ở dưới.'
+          : '(empty response)');
       historyRef.current = [...outgoing, { role: 'assistant', content: content ?? '' }];
       setMessages((m) => {
         const copy = [...m];
-        copy[copy.length - 1] = { role: 'ai', text: content ?? '(empty response)', receiptId, webSearches };
+        copy[copy.length - 1] = { role: 'ai', text, receiptId, webSearches };
         return copy;
       });
       aci.refreshBalance().then(sync).catch(() => {});
