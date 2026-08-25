@@ -51,6 +51,17 @@ main { flex: 1; display: flex; min-height: 0; }
 .msg.user { align-self: flex-end; background: var(--user); }
 .msg.ai { align-self: flex-start; background: var(--ai); border: 1px solid var(--line); }
 .msg .meta { display: block; margin-top: 8px; font-size: 12px; color: var(--muted); }
+.msg .egress {
+  padding: 8px 10px; border-radius: 8px;
+  background: rgba(255,204,102,.08); border: 1px solid rgba(255,204,102,.35);
+  color: var(--warn);
+}
+.egress-q { display: block; margin-top: 4px; color: var(--text); word-break: break-word; }
+
+button.toggle { white-space: nowrap; }
+button.toggle.on {
+  background: rgba(255,204,102,.15); border-color: var(--warn); color: var(--warn);
+}
 
 .composer { display: flex; gap: 8px; padding: 12px 16px; border-top: 1px solid var(--line); background: var(--panel); }
 .composer input { flex: 1; }

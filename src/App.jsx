@@ -15,6 +15,7 @@ function explain(e) {
       wallet_session_revoked: 'Session was revoked — reconnect.',
       wallet_missing: 'Leviathan wallet extension not found — install it and reload.',
       wallet_invalid_statement: e.message, // origin-mismatch detail is useful
+      web_search_disabled: 'Web search is not enabled on this gateway — turn the 🔍 toggle off, or ask the operator to set web_search_enabled.',
     };
     return hints[e.type] || `${e.message} (${e.type})`;
   }
@@ -34,6 +35,10 @@ export default function App() {
   const [prompt, setPrompt] = useState('');
   const [credits, setCredits] = useState(300);
   const [busy, setBusy] = useState(false);
+  // Per-request web search opt-in. When on, the query the model composes
+  // LEAVES the TEE to reach the search service — the gateway discloses every
+  // such query in the response (`web_searches`) and we show it on the reply.
+  const [webSearch, setWebSearch] = useState(false);
 
   // The conversation sent to the model, in OpenAI format. LLMs are stateless —
   // to have memory we must send the WHOLE history every request. Kept across
@@ -91,13 +96,22 @@ export default function App() {
     // Send the WHOLE conversation so the model has context.
     const outgoing = [...historyRef.current, { role: 'user', content: text }];
     try {
-      const { content, receiptId } = await aci.chat({ model, messages: outgoing });
+      // Only include the flag when on: an older gateway would forward an
+      // unknown top-level field to the upstream, which may reject it.
+      const { content, receiptId, raw } = await aci.chat({
+        model, messages: outgoing, ...(webSearch ? { web_search: true } : {}),
+      });
+      // Egress disclosure from the gateway: every query the model sent out of
+      // the enclave to the search service, verbatim ({query} or {raw}).
+      const webSearches = webSearch && Array.isArray(raw?.web_searches)
+        ? raw.web_searches.map((s) => s?.query ?? s?.raw ?? JSON.stringify(s))
+        : null;
       // Commit both turns to history only on success (a failed turn is dropped
       // so it doesn't poison later context).
       historyRef.current = [...outgoing, { role: 'assistant', content: content ?? '' }];
       setMessages((m) => {
         const copy = [...m];
-        copy[copy.length - 1] = { role: 'ai', text: content ?? '(empty response)', receiptId };
+        copy[copy.length - 1] = { role: 'ai', text: content ?? '(empty response)', receiptId, webSearches };
         return copy;
       });
       aci.refreshBalance().then(sync).catch(() => {});
@@ -110,7 +124,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [prompt, model, sync]);
+  }, [prompt, model, webSearch, sync]);
 
   const onRefresh = useCallback(async () => {
     try { await aci.refreshBalance(); sync(); notify('ok', 'Balance refreshed'); }
@@ -176,6 +190,20 @@ export default function App() {
             {messages.map((m, i) => (
               <div key={i} className={`msg ${m.role === 'user' ? 'user' : 'ai'}`} style={m.error ? { color: 'var(--err)' } : undefined}>
                 {m.text}
+                {m.webSearches && (
+                  <span className="meta egress">
+                    {m.webSearches.length ? (
+                      <>
+                        🔍 Truy vấn đã RA NGOÀI TEE tới dịch vụ search ({m.webSearches.length}):
+                        {m.webSearches.map((q, j) => (
+                          <span key={j} className="mono egress-q">“{q}”</span>
+                        ))}
+                      </>
+                    ) : (
+                      '🔍 Web search bật nhưng model không search — không có gì rời TEE.'
+                    )}
+                  </span>
+                )}
                 {m.receiptId && (
                   <span className="meta">
                     receipt {short(m.receiptId)}{' '}
@@ -190,6 +218,18 @@ export default function App() {
             <select value={model} onChange={(e) => setModel(e.target.value)} disabled={!inSession} title="Model">
               {models.map((id) => <option key={id} value={id}>{id}</option>)}
             </select>
+            <button
+              type="button"
+              className={`ghost toggle ${webSearch ? 'on' : ''}`}
+              onClick={() => setWebSearch((v) => !v)}
+              disabled={!inSession}
+              aria-pressed={webSearch}
+              title={webSearch
+                ? 'Web search BẬT: truy vấn model tự soạn sẽ rời TEE tới dịch vụ search; mọi truy vấn được hiển thị lại và ghi vào receipt.'
+                : 'Web search TẮT: không có gì rời TEE. Bật để model tra cứu thông tin mới.'}
+            >
+              🔍 Web search {webSearch ? 'ON' : 'OFF'}
+            </button>
             <input
               value={prompt}
               onChange={(e) => setPrompt(e.target.value)}
