@@ -35,6 +35,14 @@ export default function App() {
   const [prompt, setPrompt] = useState('');
   const [credits, setCredits] = useState(300);
   const [busy, setBusy] = useState(false);
+  // Top-up rail: 'onchain' pays straight from the connected wallet (one
+  // send popup, then we wait for the credit); 'stripe' opens a hosted
+  // checkout tab. On-chain is the default — the user is already here
+  // with a wallet.
+  const [payProvider, setPayProvider] = useState('onchain');
+  // Progress line for the on-chain flow (it has real stages, unlike a
+  // checkout tab): 'sign' → 'commit' → 'credit' → null when done/idle.
+  const [topupStep, setTopupStep] = useState(null);
   // Per-request web search opt-in. When on, the query the model composes
   // LEAVES the TEE to reach the search service — the gateway discloses every
   // such query in the response (`web_searches`) and we show it on the reply.
@@ -141,13 +149,54 @@ export default function App() {
   const onTopup = useCallback(async () => {
     const c = parseInt(credits, 10);
     if (!Number.isInteger(c) || c <= 0) return notify('err', 'Enter a positive credit amount');
+
+    if (payProvider !== 'onchain') {
+      // Hosted checkout (Stripe): open the tab; the webhook credits us.
+      try {
+        const { invoiceUrl, checkoutError } = await aci.createTopup({ credits: c, provider: 'stripe' });
+        if (checkoutError) notify('warn', `Intent created but checkout link failed: ${checkoutError}`);
+        else if (invoiceUrl) { window.open(invoiceUrl, '_blank'); notify('ok', 'Checkout opened — pay, then Refresh.'); }
+        else notify('warn', 'No checkout URL returned.');
+      } catch (e) { notify('err', explain(e)); }
+      return;
+    }
+
+    // On-chain: the SDK sends the EXACT quoted amount (price + sub-cent
+    // "dust" that identifies the order) through the wallet — the user
+    // never types a number, which is what makes this path safe. One
+    // wallet popup, then two waits: the note committing on-chain, and
+    // the operator's watcher crediting the ledger.
+    setBusy(true);
     try {
-      const { invoiceUrl, checkoutError } = await aci.createTopup({ credits: c });
-      if (checkoutError) notify('warn', `Intent created but checkout link failed: ${checkoutError}`);
-      else if (invoiceUrl) { window.open(invoiceUrl, '_blank'); notify('ok', 'Checkout opened — pay, then Refresh.'); }
-      else notify('warn', 'No checkout URL returned.');
-    } catch (e) { notify('err', explain(e)); }
-  }, [credits, notify]);
+      setTopupStep('sign');
+      const topup = await aci.createTopup({ credits: c, provider: 'onchain' });
+      if (topup.checkoutError || !topup.onchain) {
+        notify('err', `On-chain quote failed: ${topup.checkoutError ?? 'no payment instructions'}`);
+        return;
+      }
+      notify('ok', `Approve the payment in your wallet — sending the exact quoted amount.`);
+      setTopupStep('commit');
+      await aci.payTopup(topup); // wallet popup + waits for on-chain commit
+      setTopupStep('credit');
+      notify('ok', 'Payment committed on-chain — waiting for the credit…');
+      await aci.waitForTopup({
+        memo: topup.memo,
+        onStatus: (s) => { if (s !== 'paid') setTopupStep(`credit (${s})`); },
+      });
+      await aci.refreshBalance().catch(() => {});
+      sync();
+      notify('ok', `Credited ${c} credits ✓`);
+    } catch (e) {
+      if (e instanceof AciError && e.type === 'topup_timeout') {
+        notify('warn', 'Payment sent but not credited yet — the order stays valid; hit Refresh in a bit.');
+      } else {
+        notify('err', explain(e));
+      }
+    } finally {
+      setTopupStep(null);
+      setBusy(false);
+    }
+  }, [credits, payProvider, notify, sync]);
 
   const onLogout = useCallback(async () => {
     try { await aci.revoke(); } catch { /* best-effort */ }
@@ -269,13 +318,35 @@ export default function App() {
           </div>
 
           <div>
-            <h3>Top up (NOWPayments)</h3>
+            <h3>Top up</h3>
             <div className="card">
               <div className="row">
+                <select
+                  value={payProvider}
+                  onChange={(e) => setPayProvider(e.target.value)}
+                  disabled={busy}
+                  title="Payment method"
+                >
+                  <option value="onchain">⛓ Wallet (on-chain)</option>
+                  <option value="stripe">💳 Card (Stripe)</option>
+                </select>
                 <input type="number" min="1" value={credits} onChange={(e) => setCredits(e.target.value)} style={{ width: 90 }} />
-                <button onClick={onTopup} disabled={!inSession}>Buy credits</button>
+                <button onClick={onTopup} disabled={!inSession || busy}>Buy credits</button>
               </div>
-              <div className="hint">Opens a hosted checkout in a new tab. Balance updates after payment — hit Refresh.</div>
+              {topupStep && (
+                <div className="hint">
+                  {topupStep === 'sign' && '① Creating the quote — approve the send in your wallet…'}
+                  {topupStep === 'commit' && '② Waiting for the payment to commit on-chain…'}
+                  {String(topupStep).startsWith('credit') && `③ On-chain ✓ — waiting for the ledger to credit (${topupStep})…`}
+                </div>
+              )}
+              {!topupStep && (
+                <div className="hint">
+                  {payProvider === 'onchain'
+                    ? 'Pays the exact quoted amount straight from your connected wallet (one public P2ID note — the sub-cent digits identify your order, so never edit the amount). Credits land automatically once the payment is seen on-chain.'
+                    : 'Opens a hosted checkout in a new tab. Balance updates after payment — hit Refresh.'}
+                </div>
+              )}
             </div>
           </div>
 
@@ -283,7 +354,9 @@ export default function App() {
             <h3>Edge</h3>
             <div className="card hint">
               serviceOrigin: <span className="mono">{aci.serviceOrigin}</span><br />
-              (set via VITE_EDGE_ORIGIN — must equal the Edge's WALLET_SERVICE_ORIGIN)
+              (set via VITE_EDGE_ORIGIN — must equal the Edge's WALLET_SERVICE_ORIGIN)<br />
+              authOrigin: <span className="mono">{aci.authOrigin ?? '—'}</span><br />
+              (set via VITE_AUTH_ORIGIN — status polling for on-chain top-ups)
             </div>
           </div>
         </aside>

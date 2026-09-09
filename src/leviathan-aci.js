@@ -12,6 +12,9 @@
  *   openSession()    → one Falcon signature (wallet popup) opens a session
  *   chat()/models()  → normal calls, each silently Ed25519-signed
  *   getReceipt()     → fetch the TEE-signed receipt of a call
+ *   createTopup()    → payment intent; 'onchain' returns wallet pay instructions
+ *   payTopup()       → pay an 'onchain' intent from the wallet (one popup)
+ *   waitForTopup()   → poll until the ledger credits the intent
  *   revoke()/revokeAll()
  *
  * Requirements
@@ -118,9 +121,13 @@ export class LeviathanACI {
    * @param {object}  [opts.wallet]        Wallet provider; defaults to window.leviathan.
    * @param {typeof fetch} [opts.fetch]    Custom fetch (tests/SSR); defaults to window.fetch.
    */
-  constructor({ serviceOrigin, wallet = globalThis.leviathan, fetch = globalThis.fetch } = {}) {
+  constructor({ serviceOrigin, authOrigin = null, wallet = globalThis.leviathan, fetch = globalThis.fetch } = {}) {
     if (!serviceOrigin) throw new AciError('config', 'serviceOrigin is required');
     this.serviceOrigin = serviceOrigin.replace(/\/+$/, '');
+    // auth-service base URL (e.g. 'https://leviathan-auth.duckdns.org') — only
+    // needed by waitForTopup(), which polls the PUBLIC intent-status endpoint
+    // there. Optional; can also be passed per call.
+    this.authOrigin = authOrigin ? authOrigin.replace(/\/+$/, '') : null;
     this._wallet = wallet;
     this._fetch = fetch.bind(globalThis);
     this._account = null;   // { address, publicKeyHex }
@@ -264,16 +271,21 @@ export class LeviathanACI {
   }
 
   /**
-   * Self-serve top-up: create a payment intent for THIS wallet and get a
-   * hosted checkout URL (NOWPayments). Open `invoiceUrl` for the user; on
-   * payment their balance is credited automatically. Server sets the price
-   * from `credits` — the caller never picks the amount.
+   * Self-serve top-up: create a payment intent for THIS wallet. Server sets
+   * the price from `credits` — the caller never picks the amount.
+   *
+   * provider 'stripe' → hosted checkout: open `invoiceUrl`
+   * for the user; on payment their balance is credited automatically.
+   * provider 'onchain' → no checkout page: `onchain` carries the payment
+   * instructions (gateway address, faucet id, exact token amount, memo) —
+   * pass the whole result to payTopup() to pay from the connected wallet,
+   * then waitForTopup() until the operator's note-watcher credits it.
    * @param {object} opts
    * @param {number} opts.credits   how many credits to buy (positive integer)
-   * @param {string} [opts.provider] default 'nowpayments'
-   * @returns {Promise<{invoiceUrl: string|null, memo: string, amountCents: number|null, checkoutError: string|null, raw: object}>}
+   * @param {string} [opts.provider] 'stripe' (default) or 'onchain'
+   * @returns {Promise<{invoiceUrl: string|null, memo: string, amountCents: number|null, onchain: object|null, checkoutError: string|null, raw: object}>}
    */
-  async createTopup({ credits, provider = 'nowpayments' } = {}) {
+  async createTopup({ credits, provider = 'stripe' } = {}) {
     if (!Number.isInteger(credits) || credits <= 0) {
       throw new AciError('config', 'credits must be a positive integer');
     }
@@ -285,9 +297,110 @@ export class LeviathanACI {
       invoiceUrl: r.invoice_url ?? null,
       memo: r.memo,
       amountCents: r.amount_cents ?? null,
+      onchain: r.onchain ?? null,
       checkoutError: r.checkout_error ?? null,
       raw: r,
     };
+  }
+
+  /**
+   * Pay an 'onchain' top-up straight from the connected Leviathan wallet
+   * (ONE wallet popup — the user approves the send).
+   *
+   * v1 uses the wallet's plain requestSend(), which cannot attach the intent
+   * memo to the note; the operator's note-watcher therefore matches the
+   * payment by (sender account, exact amount, time window). Two rules follow:
+   * pay the EXACT token amount in ONE note, and pay from the SAME wallet the
+   * session is bound to. A dApp that bundles @miden-sdk can instead build a
+   * custom P2ID transaction carrying the memo as a NoteAttachment and submit
+   * it via wallet.requestTransaction({type:'Custom', ...}) — collision-free
+   * binding, but out of scope for this zero-dependency SDK.
+   *
+   * @param {object} topup  the createTopup() result (or any object with `.onchain`)
+   * @param {object} [opts]
+   * @param {string}  [opts.noteType='public']    the watcher can only see public notes
+   * @param {boolean} [opts.waitForCommit=true]   also wait for the tx to commit on-chain
+   * @returns {Promise<{transactionId: string, memo: string, commit: object|null}>}
+   *          `commit` is the wallet's waitForTransaction output (txHash, outputNotes)
+   *          when waitForCommit, else null. On-chain commit ≠ credited: follow with
+   *          waitForTopup() for the ledger side.
+   */
+  async payTopup(topup, { noteType = 'public', waitForCommit = true } = {}) {
+    const oc = topup?.onchain ?? topup?.raw?.onchain ?? null;
+    if (!oc) {
+      throw new AciError('config',
+        "not an onchain top-up — create it with createTopup({provider: 'onchain'})");
+    }
+    if (!this._wallet) throw new AciError('wallet_missing', 'Leviathan wallet extension not found');
+    if (!this.connected) throw new AciError('not_connected', 'call connect() first');
+
+    const { transactionId } = await this._wallet.requestSend({
+      senderAddress: this._account.address,
+      recipientAddress: oc.pay_to_address,
+      faucetId: oc.faucet_id,
+      noteType,
+      amount: String(oc.token_amount), // base units; the wallet BigInt()s it
+    });
+    if (!transactionId) {
+      throw new AciError('wallet_rejected', 'wallet did not return a transaction id');
+    }
+
+    let commit = null;
+    if (waitForCommit && typeof this._wallet.waitForTransaction === 'function') {
+      commit = await this._wallet.waitForTransaction(transactionId);
+      if (commit?.errorMessage) {
+        throw new AciError('onchain_tx_failed', commit.errorMessage);
+      }
+    }
+    return { transactionId, memo: oc.memo ?? topup.memo, commit };
+  }
+
+  /**
+   * Poll the intent until the ledger credits it (status 'paid') — the on-chain
+   * analogue of waiting for a checkout webhook. Polls auth-service's PUBLIC
+   * status endpoint (safe: the memo is opaque and paying it can only ever
+   * credit the intent's own identity), so it needs the auth origin — pass it
+   * here or in the constructor. Resolves with the intent; throws AciError
+   * 'topup_expired' / 'topup_cancelled' / 'topup_timeout'. After it resolves,
+   * call refreshBalance() to update `.session.balance`.
+   *
+   * @param {object} opts
+   * @param {string} opts.memo            intent memo from createTopup()
+   * @param {string} [opts.authOrigin]    default: constructor's authOrigin
+   * @param {number} [opts.timeoutMs=900000]
+   * @param {number} [opts.intervalMs=5000]
+   * @param {(status: string, intent: object) => void} [opts.onStatus] status-change callback
+   * @returns {Promise<object>} the paid intent
+   */
+  async waitForTopup({ memo, authOrigin = this.authOrigin,
+                       timeoutMs = 900_000, intervalMs = 5_000, onStatus } = {}) {
+    if (!memo) throw new AciError('config', 'memo is required');
+    if (!authOrigin) {
+      throw new AciError('config',
+        "authOrigin is required (auth-service base URL, e.g. 'https://leviathan-auth.duckdns.org')");
+    }
+    const base = authOrigin.replace(/\/+$/, '');
+    const t0 = Date.now();
+    let last = null;
+    while (Date.now() - t0 < timeoutMs) {
+      try {
+        const res = await this._fetch(`${base}/v1/payment-intents/${memo}`);
+        if (res.ok) {
+          const intent = await res.json();
+          if (intent.status !== last) { last = intent.status; onStatus?.(intent.status, intent); }
+          if (intent.status === 'paid') return intent;
+          if (intent.status === 'expired' || intent.status === 'cancelled') {
+            throw new AciError(`topup_${intent.status}`, `intent ended as '${intent.status}' without payment`);
+          }
+        }
+      } catch (e) {
+        if (e instanceof AciError) throw e;
+        // network blip — keep polling until the deadline
+      }
+      await new Promise(r => setTimeout(r, intervalMs));
+    }
+    throw new AciError('topup_timeout',
+      `intent ${memo} not paid after ${Math.round(timeoutMs / 1000)}s — the order stays valid, keep checking`);
   }
 
   /**

@@ -4,9 +4,13 @@ import { LeviathanACI, AciError } from './leviathan-aci';
 
 // serviceOrigin MUST equal the Edge's WALLET_SERVICE_ORIGIN exactly
 // (scheme + host + port), or binds are refused "different service".
+// authOrigin is the auth-service base URL — only used by waitForTopup()
+// to poll the PUBLIC intent-status endpoint after an on-chain payment.
 export const aci = new LeviathanACI({
   serviceOrigin:
     import.meta.env.VITE_EDGE_ORIGIN ?? 'https://leviathan-edge-test.duckdns.org:8443',
+  authOrigin:
+    import.meta.env.VITE_AUTH_ORIGIN ?? 'https://leviathan-auth-test.duckdns.org:8443',
 });
 
 // Session spend cap (in credits — 1 credit = 1 chat) the user authorizes when
