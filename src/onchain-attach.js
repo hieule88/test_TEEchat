@@ -1,13 +1,14 @@
-// Custom-transaction escape hatch: embed the intent memo in the note itself.
+// Custom transaction: embed the intent memo in the note itself.
 //
 // The wallet's plain requestSend() cannot carry a NoteAttachment (its payload
-// is fixed to 6 fields), so the v1 rail identifies payments by the EXACT
-// dusted amount alone. requestTransaction({type: 'Custom'}) accepts a fully
-// serialized TransactionRequest instead — so a dApp that bundles
-// @miden-sdk/miden-sdk can build the P2ID note itself, attach the memo as a
-// NoteAttachment, and hand the wallet only the signing+proving. The watcher
-// then reads the memo straight off the note: collision-free matching, with
-// the exact dusted amount kept as a second, independent check.
+// is fixed to 6 fields) — and the memo IS the payment's identity: amounts are
+// plain prices that collide across same-price orders, so a memo-less note
+// cannot be auto-credited at all. requestTransaction({type: 'Custom'})
+// accepts a fully serialized TransactionRequest instead — the dApp bundles
+// @miden-sdk/miden-sdk, builds the P2ID note itself (exact quoted amount +
+// memo as a NoteAttachment), and hands the wallet only the signing+proving.
+// The watcher reads the memo straight off the note; the exact amount is a
+// second server-enforced check.
 //
 // Wire encoding (MUST stay in lockstep with note-watcher/src/core.mjs —
 // encodeMemoAttachment/decodeMemoAttachment are the reference codec):

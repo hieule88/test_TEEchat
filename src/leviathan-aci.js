@@ -305,39 +305,34 @@ export class LeviathanACI {
 
   /**
    * Pay an 'onchain' top-up straight from the connected Leviathan wallet
-   * (ONE wallet popup — the user approves the send).
+   * (ONE wallet popup — the user approves the transaction).
    *
-   * Default path: the wallet's plain requestSend(), which cannot attach the
-   * intent memo to the note; the operator's note-watcher then matches the
-   * payment by (sender account, exact amount, time window). Two rules follow:
-   * pay the EXACT token amount in ONE note, and pay from the SAME wallet the
-   * session is bound to.
+   * The payment MUST carry the intent memo on the note itself: matching
+   * is memo-only (amounts are plain prices and collide across same-price
+   * orders), so `buildCustomTx` is REQUIRED — an app-provided async
+   * builder (see onchain-attach.js) that bundles @miden-sdk and returns
+   * the payload for wallet.requestTransaction({type:'Custom'}): a
+   * serialized P2ID transaction paying the exact quoted amount with the
+   * memo as a NoteAttachment. The builder stays app-side so this SDK
+   * remains zero-dependency.
    *
-   * Memo-on-note path: pass `buildCustomTx` (an app-provided async builder —
-   * see onchain-attach.js — that bundles @miden-sdk and returns the payload
-   * for wallet.requestTransaction({type:'Custom'}): a serialized P2ID
-   * transaction carrying the memo as a NoteAttachment). The watcher then
-   * matches by the memo ON the note — collision-free — with the exact amount
-   * kept as a second check. The builder stays app-side so this SDK remains
-   * zero-dependency. If the BUILDER fails (WASM won't load — e.g. the page
-   * isn't cross-origin-isolated), payTopup falls back to plain requestSend
-   * after calling `onFallback(err)`: the payment is equally valid, only the
-   * memo stays off the note. A wallet error (user declined) is NOT a
-   * fallback — it propagates, one popup means one decision.
+   * There is deliberately NO fallback to the wallet's plain
+   * requestSend(): a memo-less payment cannot be auto-credited — the
+   * money would arrive and park as an ops case. If the builder fails
+   * (the WASM SDK won't load — e.g. the page is not cross-origin
+   * isolated), payTopup throws 'attachment_unavailable' BEFORE any
+   * money moves; fix the deployment rather than paying blind.
    *
    * @param {object} topup  the createTopup() result (or any object with `.onchain`)
    * @param {object} [opts]
-   * @param {string}  [opts.noteType='public']    the watcher can only see public notes
    * @param {boolean} [opts.waitForCommit=true]   also wait for the tx to commit on-chain
-   * @param {(args: {senderAddress: string, onchain: object}) => Promise<object>} [opts.buildCustomTx]
-   * @param {(err: Error) => void} [opts.onFallback]  called when the builder fails
-   * @returns {Promise<{transactionId: string, memo: string, commit: object|null, viaAttachment: boolean}>}
+   * @param {(args: {senderAddress: string, onchain: object}) => Promise<object>} opts.buildCustomTx
+   * @returns {Promise<{transactionId: string, memo: string, commit: object|null, viaAttachment: true}>}
    *          `commit` is the wallet's waitForTransaction output (txHash, outputNotes)
    *          when waitForCommit, else null. On-chain commit ≠ credited: follow with
    *          waitForTopup() for the ledger side.
    */
-  async payTopup(topup, { noteType = 'public', waitForCommit = true,
-                          buildCustomTx = null, onFallback = null } = {}) {
+  async payTopup(topup, { waitForCommit = true, buildCustomTx = null } = {}) {
     const oc = topup?.onchain ?? topup?.raw?.onchain ?? null;
     if (!oc) {
       throw new AciError('config',
@@ -345,38 +340,26 @@ export class LeviathanACI {
     }
     if (!this._wallet) throw new AciError('wallet_missing', 'Leviathan wallet extension not found');
     if (!this.connected) throw new AciError('not_connected', 'call connect() first');
+    if (typeof buildCustomTx !== 'function') {
+      throw new AciError('config',
+        'buildCustomTx is required — on-chain payments must carry the intent '
+        + 'memo as a NoteAttachment (see onchain-attach.js)');
+    }
 
-    let transactionId = null;
-    let viaAttachment = false;
-    if (buildCustomTx) {
-      let payload = null;
-      try {
-        payload = await buildCustomTx({ senderAddress: this._account.address, onchain: oc });
-      } catch (e) {
-        onFallback?.(e); // builder-side failure only — fall back to plain send
-      }
-      if (payload) {
-        const r = await this._wallet.requestTransaction({ type: 'Custom', payload });
-        transactionId = r?.transactionId;
-        if (!transactionId) {
-          throw new AciError('wallet_rejected', 'wallet did not return a transaction id');
-        }
-        viaAttachment = true;
-      }
+    let payload;
+    try {
+      payload = await buildCustomTx({ senderAddress: this._account.address, onchain: oc });
+    } catch (e) {
+      throw new AciError('attachment_unavailable',
+        'cannot build the memo-carrying transaction (is the page '
+        + `cross-origin-isolated and @miden-sdk installed?): ${e?.message ?? e}`);
     }
+    const r = await this._wallet.requestTransaction({ type: 'Custom', payload });
+    const transactionId = r?.transactionId;
     if (!transactionId) {
-      const r = await this._wallet.requestSend({
-        senderAddress: this._account.address,
-        recipientAddress: oc.pay_to_address,
-        faucetId: oc.faucet_id,
-        noteType,
-        amount: String(oc.token_amount), // base units; the wallet BigInt()s it
-      });
-      transactionId = r?.transactionId;
-      if (!transactionId) {
-        throw new AciError('wallet_rejected', 'wallet did not return a transaction id');
-      }
+      throw new AciError('wallet_rejected', 'wallet did not return a transaction id');
     }
+    const viaAttachment = true;
 
     let commit = null;
     if (waitForCommit && typeof this._wallet.waitForTransaction === 'function') {

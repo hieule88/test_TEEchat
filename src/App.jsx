@@ -162,11 +162,11 @@ export default function App() {
       return;
     }
 
-    // On-chain: the SDK sends the EXACT quoted amount (price + sub-cent
-    // "dust" that identifies the order) through the wallet — the user
-    // never types a number, which is what makes this path safe. One
-    // wallet popup, then two waits: the note committing on-chain, and
-    // the operator's watcher crediting the ledger.
+    // On-chain: the SDK builds a note that carries the order memo as a
+    // NoteAttachment and pays the EXACT quoted amount — the user never
+    // types a number, and the memo on the note is what identifies the
+    // order. One wallet popup, then two waits: the note committing
+    // on-chain, and the operator's watcher crediting the ledger.
     setBusy(true);
     try {
       setTopupStep('sign');
@@ -178,17 +178,10 @@ export default function App() {
       notify('ok', `Approve the payment in your wallet — sending the exact quoted amount.`);
       setTopupStep('commit');
       // buildCustomTx embeds the order memo IN the note (NoteAttachment) via a
-      // wallet Custom transaction — collision-free matching. If the WASM SDK
-      // can't load (page not cross-origin-isolated), payTopup falls back to
-      // plain requestSend: same payment, matched by exact amount only.
-      const paid = await aci.payTopup(topup, {
-        buildCustomTx,
-        onFallback: (err) => {
-          console.warn('memo attachment unavailable, falling back to plain send:', err);
-          notify('warn', 'Paying without on-note memo (SDK unavailable) — still safe, matched by exact amount.');
-        },
-      }); // wallet popup + waits for on-chain commit
-      if (paid.viaAttachment) notify('ok', 'Payment carries the order memo on-note.');
+      // wallet Custom transaction — the memo is the ONLY thing that credits
+      // the order, so there is no fallback: if the WASM SDK can't load (page
+      // not cross-origin-isolated), payTopup throws BEFORE any money moves.
+      await aci.payTopup(topup, { buildCustomTx: buildTopupCustomTx }); // wallet popup + waits for on-chain commit
       setTopupStep('credit');
       notify('ok', 'Payment committed on-chain — waiting for the credit…');
       await aci.waitForTopup({
@@ -355,7 +348,7 @@ export default function App() {
               {!topupStep && (
                 <div className="hint">
                   {payProvider === 'onchain'
-                    ? 'Pays the exact quoted amount straight from your connected wallet (one public P2ID note — the sub-cent digits identify your order, so never edit the amount). Credits land automatically once the payment is seen on-chain.'
+                    ? 'Pays the exact quoted amount straight from your connected wallet (one public P2ID note carrying your order id, built for you — nothing to type). Credits land automatically once the payment is seen on-chain.'
                     : 'Opens a hosted checkout in a new tab. Balance updates after payment — hit Refresh.'}
                 </div>
               )}
