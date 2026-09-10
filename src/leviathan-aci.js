@@ -307,25 +307,37 @@ export class LeviathanACI {
    * Pay an 'onchain' top-up straight from the connected Leviathan wallet
    * (ONE wallet popup — the user approves the send).
    *
-   * v1 uses the wallet's plain requestSend(), which cannot attach the intent
-   * memo to the note; the operator's note-watcher therefore matches the
+   * Default path: the wallet's plain requestSend(), which cannot attach the
+   * intent memo to the note; the operator's note-watcher then matches the
    * payment by (sender account, exact amount, time window). Two rules follow:
    * pay the EXACT token amount in ONE note, and pay from the SAME wallet the
-   * session is bound to. A dApp that bundles @miden-sdk can instead build a
-   * custom P2ID transaction carrying the memo as a NoteAttachment and submit
-   * it via wallet.requestTransaction({type:'Custom', ...}) — collision-free
-   * binding, but out of scope for this zero-dependency SDK.
+   * session is bound to.
+   *
+   * Memo-on-note path: pass `buildCustomTx` (an app-provided async builder —
+   * see onchain-attach.js — that bundles @miden-sdk and returns the payload
+   * for wallet.requestTransaction({type:'Custom'}): a serialized P2ID
+   * transaction carrying the memo as a NoteAttachment). The watcher then
+   * matches by the memo ON the note — collision-free — with the exact amount
+   * kept as a second check. The builder stays app-side so this SDK remains
+   * zero-dependency. If the BUILDER fails (WASM won't load — e.g. the page
+   * isn't cross-origin-isolated), payTopup falls back to plain requestSend
+   * after calling `onFallback(err)`: the payment is equally valid, only the
+   * memo stays off the note. A wallet error (user declined) is NOT a
+   * fallback — it propagates, one popup means one decision.
    *
    * @param {object} topup  the createTopup() result (or any object with `.onchain`)
    * @param {object} [opts]
    * @param {string}  [opts.noteType='public']    the watcher can only see public notes
    * @param {boolean} [opts.waitForCommit=true]   also wait for the tx to commit on-chain
-   * @returns {Promise<{transactionId: string, memo: string, commit: object|null}>}
+   * @param {(args: {senderAddress: string, onchain: object}) => Promise<object>} [opts.buildCustomTx]
+   * @param {(err: Error) => void} [opts.onFallback]  called when the builder fails
+   * @returns {Promise<{transactionId: string, memo: string, commit: object|null, viaAttachment: boolean}>}
    *          `commit` is the wallet's waitForTransaction output (txHash, outputNotes)
    *          when waitForCommit, else null. On-chain commit ≠ credited: follow with
    *          waitForTopup() for the ledger side.
    */
-  async payTopup(topup, { noteType = 'public', waitForCommit = true } = {}) {
+  async payTopup(topup, { noteType = 'public', waitForCommit = true,
+                          buildCustomTx = null, onFallback = null } = {}) {
     const oc = topup?.onchain ?? topup?.raw?.onchain ?? null;
     if (!oc) {
       throw new AciError('config',
@@ -334,15 +346,36 @@ export class LeviathanACI {
     if (!this._wallet) throw new AciError('wallet_missing', 'Leviathan wallet extension not found');
     if (!this.connected) throw new AciError('not_connected', 'call connect() first');
 
-    const { transactionId } = await this._wallet.requestSend({
-      senderAddress: this._account.address,
-      recipientAddress: oc.pay_to_address,
-      faucetId: oc.faucet_id,
-      noteType,
-      amount: String(oc.token_amount), // base units; the wallet BigInt()s it
-    });
+    let transactionId = null;
+    let viaAttachment = false;
+    if (buildCustomTx) {
+      let payload = null;
+      try {
+        payload = await buildCustomTx({ senderAddress: this._account.address, onchain: oc });
+      } catch (e) {
+        onFallback?.(e); // builder-side failure only — fall back to plain send
+      }
+      if (payload) {
+        const r = await this._wallet.requestTransaction({ type: 'Custom', payload });
+        transactionId = r?.transactionId;
+        if (!transactionId) {
+          throw new AciError('wallet_rejected', 'wallet did not return a transaction id');
+        }
+        viaAttachment = true;
+      }
+    }
     if (!transactionId) {
-      throw new AciError('wallet_rejected', 'wallet did not return a transaction id');
+      const r = await this._wallet.requestSend({
+        senderAddress: this._account.address,
+        recipientAddress: oc.pay_to_address,
+        faucetId: oc.faucet_id,
+        noteType,
+        amount: String(oc.token_amount), // base units; the wallet BigInt()s it
+      });
+      transactionId = r?.transactionId;
+      if (!transactionId) {
+        throw new AciError('wallet_rejected', 'wallet did not return a transaction id');
+      }
     }
 
     let commit = null;
@@ -352,7 +385,7 @@ export class LeviathanACI {
         throw new AciError('onchain_tx_failed', commit.errorMessage);
       }
     }
-    return { transactionId, memo: oc.memo ?? topup.memo, commit };
+    return { transactionId, memo: oc.memo ?? topup.memo, commit, viaAttachment };
   }
 
   /**

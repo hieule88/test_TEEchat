@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useRef } from 'react';
 import { aci, AciError, MAX_SPEND } from './aci';
+import { buildTopupCustomTx } from './onchain-attach';
 
 // React escapes all interpolated text ({value}) by default, so server-provided
 // strings (model ids, error messages, receipts) can never inject markup.
@@ -176,7 +177,18 @@ export default function App() {
       }
       notify('ok', `Approve the payment in your wallet — sending the exact quoted amount.`);
       setTopupStep('commit');
-      await aci.payTopup(topup); // wallet popup + waits for on-chain commit
+      // buildCustomTx embeds the order memo IN the note (NoteAttachment) via a
+      // wallet Custom transaction — collision-free matching. If the WASM SDK
+      // can't load (page not cross-origin-isolated), payTopup falls back to
+      // plain requestSend: same payment, matched by exact amount only.
+      const paid = await aci.payTopup(topup, {
+        buildCustomTx,
+        onFallback: (err) => {
+          console.warn('memo attachment unavailable, falling back to plain send:', err);
+          notify('warn', 'Paying without on-note memo (SDK unavailable) — still safe, matched by exact amount.');
+        },
+      }); // wallet popup + waits for on-chain commit
+      if (paid.viaAttachment) notify('ok', 'Payment carries the order memo on-note.');
       setTopupStep('credit');
       notify('ok', 'Payment committed on-chain — waiting for the credit…');
       await aci.waitForTopup({
