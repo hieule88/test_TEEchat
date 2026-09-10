@@ -23,4 +23,11 @@ export default defineConfig({
   server: { port: 5173, headers: coopCoep },
   preview: { headers: coopCoep },
   optimizeDeps: { exclude: ['@miden-sdk/miden-sdk'] },
+  // The SDK spawns its compute worker via `new Worker(new URL(...))`;
+  // Vite's default IIFE worker bundling forbids code-splitting, which
+  // the SDK's chunks need — ES-format workers lift that limit.
+  worker: { format: 'es' },
+  // The SDK's WASM chunk uses top-level await → needs es2022 (still
+  // older than any browser that has SharedArrayBuffer + the wallet).
+  build: { target: 'es2022' },
 });

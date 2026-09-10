@@ -91,8 +91,13 @@ export async function buildTopupCustomTx({ senderAddress, onchain }) {
     wasm.NoteType.Public,
     attachment,
   );
+  // withOwnOutputNotes takes NoteArray in this SDK build (verified by
+  // note-watcher's smoke-attachment against the real WASM — the
+  // OutputNoteArray recipe in the SDK's own send(returnNote) targets a
+  // newer crate and throws here). NoteArray MOVES the note handle:
+  // `note` must not be touched after this line.
   const request = new wasm.TransactionRequestBuilder()
-    .withOwnOutputNotes(new wasm.OutputNoteArray([wasm.OutputNote.full(note)]))
+    .withOwnOutputNotes(new wasm.NoteArray([note]))
     .build();
 
   return {
