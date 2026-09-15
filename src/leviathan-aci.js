@@ -304,6 +304,57 @@ export class LeviathanACI {
   }
 
   /**
+   * Rebuild the payment instructions for an order you already created,
+   * instead of creating another one.
+   *
+   * Reach for this whenever a top-up was created but not paid — the
+   * provider was down, the user closed the tab, the wallet popup was
+   * declined. Pending orders are capped per rail and only an operator
+   * can cancel one, so every abandoned order costs the user a slot until
+   * it expires (30 days on the card rail). Minting a fresh order per
+   * click is how a user locks themselves out of paying at all.
+   *
+   * Talks to auth-service directly (like waitForTopup) because the
+   * endpoint is public read-mostly: holding the memo only ever lets you
+   * ask for instructions, and paying them credits the order's original
+   * owner. The order's RAIL is fixed at creation — this rebuilds that
+   * rail's instructions and cannot move it to another.
+   *
+   * @param {object} opts
+   * @param {string} opts.memo          memo from the original createTopup()
+   * @param {string} [opts.authOrigin]  default: constructor's authOrigin
+   * @returns {Promise<{invoiceUrl: string|null, memo: string, amountCents: number|null, onchain: object|null, raw: object}>}
+   * @throws {AciError} 'topup_not_pending' when the order can no longer
+   *   be paid (already paid, expired, cancelled) — create a new one.
+   */
+  async retryCheckout({ memo, authOrigin = this.authOrigin } = {}) {
+    if (!memo) throw new AciError('config', 'memo is required');
+    if (!authOrigin) {
+      throw new AciError('config',
+        "authOrigin is required (auth-service base URL, e.g. 'https://leviathan-auth.duckdns.org')");
+    }
+    const base = authOrigin.replace(/\/+$/, '');
+    const res = await this._fetch(`${base}/v1/payment-intents/${memo}/checkout`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: '{}',   // no provider: "this order's own rail"
+    });
+    if (res.status === 404 || res.status === 409) {
+      throw new AciError('topup_not_pending',
+        `order ${memo} can no longer be paid — create a new top-up`, res.status);
+    }
+    if (!res.ok) throw await toError(res);
+    const r = await res.json();
+    return {
+      invoiceUrl: r.invoice_url ?? null,
+      memo: r.memo,
+      amountCents: r.amount_cents ?? null,
+      onchain: r.onchain ?? null,
+      raw: r,
+    };
+  }
+
+  /**
    * Pay an 'onchain' top-up straight from the connected Leviathan wallet
    * (ONE wallet popup — the user approves the transaction).
    *

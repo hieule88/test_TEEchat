@@ -44,6 +44,11 @@ export default function App() {
   // Progress line for the on-chain flow (it has real stages, unlike a
   // checkout tab): 'sign' → 'commit' → 'credit' → null when done/idle.
   const [topupStep, setTopupStep] = useState(null);
+  // The last order we created and never saw paid, as {provider, memo,
+  // credits}. Pending orders are capped per rail and only an operator can
+  // cancel one, so minting a fresh order on every click is how a user
+  // locks themselves out of paying: we reuse this one instead.
+  const [pendingOrder, setPendingOrder] = useState(null);
   // Per-request web search opt-in. When on, the query the model composes
   // LEAVES the TEE to reach the search service — the gateway discloses every
   // such query in the response (`web_searches`) and we show it on the reply.
@@ -151,14 +156,50 @@ export default function App() {
     const c = parseInt(credits, 10);
     if (!Number.isInteger(c) || c <= 0) return notify('err', 'Enter a positive credit amount');
 
-    if (payProvider !== 'onchain') {
+    const provider = payProvider === 'onchain' ? 'onchain' : 'stripe';
+    // The order we already created for this rail and amount, if any.
+    const reusable = (pendingOrder?.provider === provider
+                      && pendingOrder.credits === c) ? pendingOrder : null;
+
+    // Reuse that order rather than minting another one. Abandoned orders
+    // (tab closed, wallet popup declined, provider hiccup) hold a capped
+    // slot until they expire and only an operator can cancel them, so a
+    // fresh order per click is how a user locks themselves out of paying.
+    const orderFor = async () => {
+      if (reusable) {
+        try {
+          return await aci.retryCheckout({ memo: reusable.memo });
+        } catch (e) {
+          if (e instanceof AciError && e.type === 'topup_not_pending') {
+            setPendingOrder(null);   // paid or expired — fall through to a new one
+          } else {
+            // Could not reach the server to reopen it. Creating a second
+            // order here would quietly spend another slot — exactly what
+            // reuse exists to prevent — so stop and say what to do.
+            throw new AciError('topup_reuse_failed',
+              `Could not reopen your unpaid order ${reusable.memo}: ${e.message}. `
+              + 'Try again, or change the amount to start a new order.');
+          }
+        }
+      }
+      const fresh = await aci.createTopup({ credits: c, provider });
+      if (fresh.memo) setPendingOrder({ provider, memo: fresh.memo, credits: c });
+      return fresh;
+    };
+
+    if (provider === 'stripe') {
       // Hosted checkout (Stripe): open the tab; the webhook credits us.
+      setBusy(true);
       try {
-        const { invoiceUrl, checkoutError } = await aci.createTopup({ credits: c, provider: 'stripe' });
-        if (checkoutError) notify('warn', `Intent created but checkout link failed: ${checkoutError}`);
+        const { invoiceUrl, checkoutError } = await orderFor();
+        // The order exists but the provider was down. It is remembered
+        // above, so the next click retries THIS order instead of leaving
+        // it behind and creating a second one.
+        if (checkoutError) notify('warn', `Order created but the checkout link failed: ${checkoutError} — try again in a moment.`);
         else if (invoiceUrl) { window.open(invoiceUrl, '_blank'); notify('ok', 'Checkout opened — pay, then Refresh.'); }
         else notify('warn', 'No checkout URL returned.');
       } catch (e) { notify('err', explain(e)); }
+      finally { setBusy(false); }
       return;
     }
 
@@ -169,31 +210,52 @@ export default function App() {
     // on-chain, and the operator's watcher crediting the ledger.
     setBusy(true);
     try {
-      setTopupStep('sign');
-      const topup = await aci.createTopup({ credits: c, provider: 'onchain' });
-      if (topup.checkoutError || !topup.onchain) {
-        notify('err', `On-chain quote failed: ${topup.checkoutError ?? 'no payment instructions'}`);
-        return;
+      // An order we already PAID but never saw credited (the wait timed
+      // out, the tab closed) must never be paid a second time: two notes
+      // on one memo means the ledger credits the order once and flags a
+      // duplicate the operator has to refund by hand. Resume the wait.
+      let memo = reusable?.paidTx ? reusable.memo : null;
+
+      if (memo) {
+        notify('ok', 'This order is already paid — waiting for the credit…');
+        setTopupStep('credit');
+      } else {
+        setTopupStep('sign');
+        const topup = await orderFor();
+        if (topup.checkoutError || !topup.onchain) {
+          notify('err', `On-chain quote failed: ${topup.checkoutError ?? 'no payment instructions'}`);
+          return;
+        }
+        memo = topup.memo;
+        notify('ok', `Approve the payment in your wallet — sending the exact quoted amount.`);
+        setTopupStep('commit');
+        // buildCustomTx embeds the order memo IN the note (NoteAttachment) via a
+        // wallet Custom transaction — the memo is the ONLY thing that credits
+        // the order, so there is no fallback: if the WASM SDK can't load (page
+        // not cross-origin-isolated), payTopup throws BEFORE any money moves.
+        const paid = await aci.payTopup(topup, { buildCustomTx: buildTopupCustomTx });
+        // The money has left the wallet. Record that against the order so
+        // a later click resumes the wait above instead of paying again.
+        setPendingOrder({ provider: 'onchain', memo, credits: c,
+                          paidTx: paid.transactionId });
+        setTopupStep('credit');
+        notify('ok', 'Payment committed on-chain — waiting for the credit…');
       }
-      notify('ok', `Approve the payment in your wallet — sending the exact quoted amount.`);
-      setTopupStep('commit');
-      // buildCustomTx embeds the order memo IN the note (NoteAttachment) via a
-      // wallet Custom transaction — the memo is the ONLY thing that credits
-      // the order, so there is no fallback: if the WASM SDK can't load (page
-      // not cross-origin-isolated), payTopup throws BEFORE any money moves.
-      await aci.payTopup(topup, { buildCustomTx: buildTopupCustomTx }); // wallet popup + waits for on-chain commit
-      setTopupStep('credit');
-      notify('ok', 'Payment committed on-chain — waiting for the credit…');
+
       await aci.waitForTopup({
-        memo: topup.memo,
+        memo,
         onStatus: (s) => { if (s !== 'paid') setTopupStep(`credit (${s})`); },
       });
       await aci.refreshBalance().catch(() => {});
       sync();
+      setPendingOrder(null);   // this one is settled — the next click is a new order
       notify('ok', `Credited ${c} credits ✓`);
     } catch (e) {
       if (e instanceof AciError && e.type === 'topup_timeout') {
-        notify('warn', 'Payment sent but not credited yet — the order stays valid; hit Refresh in a bit.');
+        // Paid on-chain, not credited yet. The order is kept WITH its
+        // paidTx, so clicking again resumes the wait rather than paying
+        // a second time.
+        notify('warn', 'Payment sent but not credited yet — press Buy credits again to keep waiting (it will not pay twice).');
       } else {
         notify('err', explain(e));
       }
@@ -201,7 +263,7 @@ export default function App() {
       setTopupStep(null);
       setBusy(false);
     }
-  }, [credits, payProvider, notify, sync]);
+  }, [credits, payProvider, pendingOrder, notify, sync]);
 
   const onLogout = useCallback(async () => {
     try { await aci.revoke(); } catch { /* best-effort */ }
