@@ -296,6 +296,11 @@ export class LeviathanACI {
     return {
       invoiceUrl: r.invoice_url ?? null,
       memo: r.memo,
+      // The rail the SERVER put this order on. Branch on THIS, never on
+      // the provider you asked for: the operator's TOPUP_PROVIDER_OVERRIDE
+      // can route every top-up onto one rail, and the order's rail is
+      // then fixed for life.
+      provider: r.provider ?? null,
       amountCents: r.amount_cents ?? null,
       onchain: r.onchain ?? null,
       checkoutError: r.checkout_error ?? null,
@@ -348,6 +353,7 @@ export class LeviathanACI {
     return {
       invoiceUrl: r.invoice_url ?? null,
       memo: r.memo,
+      provider: r.provider ?? null,   // the order's rail — see createTopup
       amountCents: r.amount_cents ?? null,
       onchain: r.onchain ?? null,
       raw: r,
