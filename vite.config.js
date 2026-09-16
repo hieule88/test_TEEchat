@@ -7,8 +7,8 @@ import react from '@vitejs/plugin-react';
 // COOP/COEP make the page cross-origin isolated: @miden-sdk/miden-sdk is a
 // multi-threaded WASM build whose shared memory needs SharedArrayBuffer,
 // which browsers only enable on isolated pages. Without these headers the
-// SDK import fails and payTopup falls back to plain requestSend (payment
-// still works, the memo just isn't attached to the note). Side effect of
+// SDK import fails and payTopup throws 'attachment_unavailable' before any
+// money moves — the on-chain rail is simply unavailable. Side effect of
 // COEP: every cross-origin subresource needs CORS/CORP — our only
 // cross-origin traffic is fetch() to the Edge/auth APIs, which is CORS-mode
 // already. The SDK is also excluded from Vite's dep pre-bundling: esbuild's

@@ -21,9 +21,9 @@
 //
 // The SDK is imported LAZILY and only here: its multi-threaded WASM needs
 // SharedArrayBuffer, i.e. a cross-origin-isolated page (COOP+COEP headers —
-// see vite.config.js / public/serve.json). When the import or init fails the
-// caller falls back to plain requestSend(): the payment still works and still
-// matches, only the memo stays off the note.
+// see vite.config.js / public/serve.json). There is no fallback when the
+// import or init fails: a memo-less note cannot be credited, so payTopup
+// throws 'attachment_unavailable' BEFORE any money moves.
 
 export const TOPUP_ATTACHMENT_SCHEME = 0x4c565431; // "LVT1"
 
