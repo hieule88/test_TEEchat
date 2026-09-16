@@ -8,9 +8,9 @@ import { LeviathanACI, AciError } from './leviathan-aci';
 // to poll the PUBLIC intent-status endpoint after an on-chain payment.
 export const aci = new LeviathanACI({
   serviceOrigin:
-    import.meta.env.VITE_EDGE_ORIGIN ?? 'https://leviathan-edge-test.duckdns.org:8443',
+    import.meta.env.VITE_EDGE_ORIGIN ?? 'https://leviathan-edge.duckdns.org',
   authOrigin:
-    import.meta.env.VITE_AUTH_ORIGIN ?? 'https://leviathan-auth-test.duckdns.org:8443',
+    import.meta.env.VITE_AUTH_ORIGIN ?? 'https://leviathan-auth.duckdns.org',
 });
 
 // Session spend cap (in credits — 1 credit = 1 chat) the user authorizes when
