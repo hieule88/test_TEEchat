@@ -17,6 +17,10 @@ function explain(e) {
       wallet_missing: 'Leviathan wallet extension not found — install it and reload.',
       wallet_invalid_statement: e.message, // origin-mismatch detail is useful
       web_search_disabled: 'Web search is not enabled on this gateway — turn the 🔍 toggle off, or ask the operator to set web_search_enabled.',
+      // The order's transaction was prepared for a different wallet account
+      // than the one now connected. The order is kept, so the next click's
+      // retryCheckout prepares it for the current account.
+      sender_mismatch: 'Your wallet account changed since this order was created — press Buy credits again to pay from the current account.',
     };
     return hints[e.type] || `${e.message} (${e.type})`;
   }
@@ -269,7 +273,8 @@ export default function App() {
       setPendingOrder({ wanted, provider: 'onchain', memo: order.memo,
                         credits: c, paidTx: paid.transactionId });
       setTopupStep('credit');
-      notify('ok', 'Payment committed on-chain — waiting for the credit…');
+      notify('ok', `Payment committed on-chain (${paid.source === 'server'
+        ? 'server-built payload' : 'client-built payload'}) — waiting for the credit…`);
       await waitForCredit(order.memo);
     } catch (e) {
       if (e instanceof AciError && e.type === 'topup_timeout') {

@@ -89,18 +89,28 @@ polls until the operator's note-watcher credits the ledger. The panel walks
 ① quote/sign → ② commit → ③ credit. **💳 Card (Stripe)** keeps the old
 hosted-checkout tab.
 
-### The memo lives ON the note (required)
+### The memo lives ON the note — built by the server, client fallback kept
 
-`src/onchain-attach.js` builds the payment: it creates the P2ID note
-itself with `@miden-sdk/miden-sdk`, embeds the intent memo as a
-`NoteAttachment` (scheme `0x4C565431` "LVT1" — codec kept in lockstep
-with `note-watcher/src/core.mjs`), serializes the `TransactionRequest`,
-and submits it through `wallet.requestTransaction({type: 'Custom'})` —
-the wallet only signs and proves. The memo is the ONLY thing that
-matches the payment to the order (amounts are plain prices and collide
-across same-price orders), so there is **no plain-send fallback**: if
-the SDK can't load, `payTopup` throws `attachment_unavailable` before any
-money moves. Requirements:
+The normal path needs no SDK in the page: `createTopup` sends the
+connected account's address, the **server** builds the transaction (its
+`note-builder` runs the same SDK build and the same memo codec as the
+watcher that later reads the note) and returns it as
+`onchain.custom_tx`; `payTopup` hands it to
+`wallet.requestTransaction({type: 'Custom'})` (`paid.source === 'server'`
+— the status line says which path paid). The transaction is bound to the
+account that created the order: switching wallet accounts in between
+gives `sender_mismatch` before anything moves, and the next click's
+`retryCheckout` prepares it for the current account.
+
+`src/onchain-attach.js` is the **fallback** (`paid.source === 'client'`),
+used only for an order the server returned without `custom_tx`: it
+creates the P2ID note itself with `@miden-sdk/miden-sdk`, embeds the
+memo as a `NoteAttachment` (scheme `0x4C565431` "LVT1" — codec kept in
+lockstep with `note-watcher/src/core.mjs`), serializes and submits it the
+same way. The memo is the ONLY thing that matches the payment to the
+order, so there is **no plain-send fallback**: if the SDK can't load,
+`payTopup` throws `attachment_unavailable` before any money moves. The
+two requirements below apply to this fallback only:
 
 - **Registry**: the SDK comes from the private Gitea npm registry
   (`.npmrc`), version-pinned to the exact build the wallet extension
