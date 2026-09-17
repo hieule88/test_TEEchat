@@ -285,12 +285,20 @@ export class LeviathanACI {
    * @param {string} [opts.provider] 'stripe' (default) or 'onchain'
    * @returns {Promise<{invoiceUrl: string|null, memo: string, amountCents: number|null, onchain: object|null, checkoutError: string|null, raw: object}>}
    */
-  async createTopup({ credits, provider = 'stripe' } = {}) {
+  async createTopup({ credits, provider = 'stripe',
+                      senderAddress = this._account?.address ?? null } = {}) {
     if (!Number.isInteger(credits) || credits <= 0) {
       throw new AciError('config', 'credits must be a positive integer');
     }
+    // On-chain: name the paying account so the SERVER builds the wallet
+    // payload (onchain.custom_tx) — the page then needs no Miden SDK.
+    // A Miden note names its sender and the wallet signs only for its
+    // own account, so this must be the account that will approve it:
+    // the connected one, by default.
+    const body = { credits, provider };
+    if (provider === 'onchain' && senderAddress) body.sender_address = senderAddress;
     const res = await this.signedFetch('/v1/wallet/payment-intents',
-      { body: JSON.stringify({ credits, provider }) });
+      { body: JSON.stringify(body) });
     if (!res.ok) throw await toError(res);
     const r = await res.json();
     return {
@@ -332,17 +340,22 @@ export class LeviathanACI {
    * @throws {AciError} 'topup_not_pending' when the order can no longer
    *   be paid (already paid, expired, cancelled) — create a new one.
    */
-  async retryCheckout({ memo, authOrigin = this.authOrigin } = {}) {
+  async retryCheckout({ memo, authOrigin = this.authOrigin,
+                        senderAddress = this._account?.address ?? null } = {}) {
     if (!memo) throw new AciError('config', 'memo is required');
     if (!authOrigin) {
       throw new AciError('config',
         "authOrigin is required (auth-service base URL, e.g. 'https://leviathan-auth.duckdns.org')");
     }
     const base = authOrigin.replace(/\/+$/, '');
+    // No provider: "this order's own rail". The sender lets the server
+    // hand back the payload it stored for this account, or build one for
+    // a different account the user switched to (see createTopup).
+    const body = senderAddress ? { sender_address: senderAddress } : {};
     const res = await this._fetch(`${base}/v1/payment-intents/${memo}/checkout`, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
-      body: '{}',   // no provider: "this order's own rail"
+      body: JSON.stringify(body),
     });
     if (res.status === 404 || res.status === 409) {
       throw new AciError('topup_not_pending',
@@ -383,8 +396,11 @@ export class LeviathanACI {
    * @param {object} topup  the createTopup() result (or any object with `.onchain`)
    * @param {object} [opts]
    * @param {boolean} [opts.waitForCommit=true]   also wait for the tx to commit on-chain
-   * @param {(args: {senderAddress: string, onchain: object}) => Promise<object>} opts.buildCustomTx
-   * @returns {Promise<{transactionId: string, memo: string, commit: object|null, viaAttachment: true}>}
+   * @param {(args: {senderAddress: string, onchain: object}) => Promise<object>} [opts.buildCustomTx]
+   *        Fallback builder for orders WITHOUT a server-built payload (see below).
+   * @returns {Promise<{transactionId: string, memo: string, commit: object|null, viaAttachment: true, source: 'server'|'client'}>}
+   *          `source` says who built the payload: 'server' (onchain.custom_tx,
+   *          the normal case) or 'client' (the buildCustomTx fallback).
    *          `commit` is the wallet's waitForTransaction output (txHash, outputNotes)
    *          when waitForCommit, else null. On-chain commit ≠ credited: follow with
    *          waitForTopup() for the ledger side.
@@ -397,19 +413,44 @@ export class LeviathanACI {
     }
     if (!this._wallet) throw new AciError('wallet_missing', 'Leviathan wallet extension not found');
     if (!this.connected) throw new AciError('not_connected', 'call connect() first');
-    if (typeof buildCustomTx !== 'function') {
-      throw new AciError('config',
-        'buildCustomTx is required — on-chain payments must carry the intent '
-        + 'memo as a NoteAttachment (see onchain-attach.js)');
-    }
-
     let payload;
-    try {
-      payload = await buildCustomTx({ senderAddress: this._account.address, onchain: oc });
-    } catch (e) {
-      throw new AciError('attachment_unavailable',
-        'cannot build the memo-carrying transaction (is the page '
-        + `cross-origin-isolated and @miden-sdk installed?): ${e?.message ?? e}`);
+    let source;
+    const served = oc.custom_tx;
+    if (served?.transactionRequest && served?.address) {
+      // The SERVER built the payload (the order was created with this
+      // account as sender). It is bound to that account: a Miden note
+      // names its sender and the wallet signs only for its own account,
+      // so paying from another account cannot work — say so instead of
+      // letting the wallet fail opaquely, and point at the fix.
+      if (this._account.address && served.address !== this._account.address) {
+        throw new AciError('sender_mismatch',
+          `this order's payment was prepared for account ${served.address}, but the `
+          + `connected account is ${this._account.address} — call retryCheckout({memo}) `
+          + 'to prepare it for the connected account, then pay again');
+      }
+      payload = {
+        address: served.address,
+        recipientAddress: served.recipientAddress ?? oc.pay_to_address,
+        transactionRequest: served.transactionRequest,
+      };
+      source = 'server';
+    } else if (typeof buildCustomTx === 'function') {
+      // Legacy/fallback: the page bundles the Miden SDK and builds the
+      // note itself (see onchain-attach.js). Needs a cross-origin-isolated
+      // page for the SDK's WASM.
+      try {
+        payload = await buildCustomTx({ senderAddress: this._account.address, onchain: oc });
+      } catch (e) {
+        throw new AciError('attachment_unavailable',
+          'cannot build the memo-carrying transaction (is the page '
+          + `cross-origin-isolated and @miden-sdk installed?): ${e?.message ?? e}`);
+      }
+      source = 'client';
+    } else {
+      throw new AciError('config',
+        'no wallet payload: the server returned no onchain.custom_tx (was the '
+        + 'order created with a connected wallet, and is ONCHAIN_BUILDER_URL set '
+        + 'on the server?) and no buildCustomTx fallback was given');
     }
     const r = await this._wallet.requestTransaction({ type: 'Custom', payload });
     const transactionId = r?.transactionId;
@@ -425,7 +466,7 @@ export class LeviathanACI {
         throw new AciError('onchain_tx_failed', commit.errorMessage);
       }
     }
-    return { transactionId, memo: oc.memo ?? topup.memo, commit, viaAttachment };
+    return { transactionId, memo: oc.memo ?? topup.memo, commit, viaAttachment, source };
   }
 
   /**
