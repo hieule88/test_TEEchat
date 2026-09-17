@@ -1,6 +1,5 @@
 import React, { useState, useCallback, useRef } from 'react';
 import { aci, AciError, MAX_SPEND } from './aci';
-import { buildTopupCustomTx } from './onchain-attach';
 
 // React escapes all interpolated text ({value}) by default, so server-provided
 // strings (model ids, error messages, receipts) can never inject markup.
@@ -252,10 +251,12 @@ export default function App() {
         return;
       }
 
-      // On-chain: the SDK builds a note that carries the order memo as a
-      // NoteAttachment and pays the EXACT quoted amount — the user never
-      // types a number, and the memo on the note is what identifies the
-      // order. One wallet popup, then two waits: the note committing
+      // On-chain: the SERVER built the transaction (order.onchain.custom_tx)
+      // — a public note that pays the EXACT quoted amount and carries the
+      // order memo as a NoteAttachment; the user never types a number, and
+      // the memo on the note is what identifies the order. This page holds
+      // no Miden SDK: it hands the payload to the wallet, which signs and
+      // publishes it. One wallet popup, then two waits: the note committing
       // on-chain, and the operator's watcher crediting the ledger.
       if (order.checkoutError || !order.onchain) {
         notify('err', `On-chain quote failed: ${order.checkoutError ?? 'no payment instructions'}`);
@@ -263,11 +264,13 @@ export default function App() {
       }
       notify('ok', `Approve the payment in your wallet — sending the exact quoted amount.`);
       setTopupStep('commit');
-      // buildCustomTx embeds the order memo IN the note (NoteAttachment) via a
-      // wallet Custom transaction — the memo is the ONLY thing that credits
-      // the order, so there is no fallback: if the WASM SDK can't load (page
-      // not cross-origin-isolated), payTopup throws BEFORE any money moves.
-      const paid = await aci.payTopup(order, { buildCustomTx: buildTopupCustomTx });
+      // The payload is bound to the account that created the order (a Miden
+      // note names its sender; the wallet signs only for its own account):
+      // if the wallet's active account changed meanwhile, payTopup throws
+      // 'sender_mismatch' BEFORE any money moves and the next click's
+      // retryCheckout prepares the order for the current account. If the
+      // server sent no payload at all, it throws 'config' — fail closed.
+      const paid = await aci.payTopup(order);
       // The money has left the wallet. Record that against the order so
       // a later click resumes the wait above instead of paying again.
       setPendingOrder({ wanted, provider: 'onchain', memo: order.memo,

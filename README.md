@@ -5,25 +5,23 @@ handover's `README-FRONTEND.md`: a Vite/React app that uses the
 `leviathan-aci.js` SDK. No API key — every request is signed by the user's
 Leviathan wallet.
 
-It doubles as the **reference implementation** for the on-chain top-up rail:
-the handover package (`leviathan-ai-gateway-verify/wallet-aci/dapp/`) ships
-`onchain-attach.js` and `topup-flow.example.jsx` lifted from here.
+It doubles as the **reference implementation** for the on-chain top-up rail
+(handover package: `leviathan-ai-gateway-verify/wallet-aci/dapp/`). It is
+deliberately a plain Vite app: **no Miden SDK, no WASM, no private npm
+registry, no special HTTP headers** — the server prepares the on-chain
+transaction and this page only hands it to the wallet.
 
 ```
 test_frontend/
   index.html            ← Vite entry
-  vite.config.js        ← COOP/COEP + the three settings the WASM SDK needs
+  vite.config.js        ← stock Vite + React
   package.json
-  .npmrc                ← private Gitea registry for @miden-sdk/miden-sdk
   .env                  ← VITE_EDGE_ORIGIN + VITE_AUTH_ORIGIN
-  public/
-    serve.json          ← COOP/COEP for `npm start` (copied into dist/ by Vite)
   src/
     main.jsx
     App.jsx             ← the chat UI + two-rail top-up (React)
     aci.js              ← the single LeviathanACI instance (README §2)
     leviathan-aci.js    ← SDK, import swapped to '@noble/curves/ed25519' (README §1)
-    onchain-attach.js   ← Custom-tx builder: memo-as-NoteAttachment (see below)
     styles.css
 ```
 
@@ -31,7 +29,6 @@ test_frontend/
 
 ```bash
 cd test_frontend
-export GITEA_NPM_TOKEN=…     # required — see "Registry" below
 npm install
 npm run dev                  # http://localhost:5173
 ```
@@ -45,8 +42,7 @@ so a Railway variable silently wins over the committed `.env` — check the
 
 1. **Get the SDK** — `npm i @noble/curves`, copied `leviathan-aci.js` into
    `src/`, and changed its top import to
-   `import { ed25519, x25519 } from '@noble/curves/ed25519';`. The on-chain
-   rail adds `@miden-sdk/miden-sdk` (pinned, private registry).
+   `import { ed25519, x25519 } from '@noble/curves/ed25519';`.
 2. **One SDK instance** — `src/aci.js`:
    ```js
    import { LeviathanACI, AciError } from './leviathan-aci';
@@ -72,8 +68,8 @@ so a Railway variable silently wins over the committed `.env` — check the
 3. **Leviathan wallet extension** installed, with a wallet created; its version
    must match the deployed `wallet-verifier` crypto.
 4. **Credits**: a new wallet starts at 0 — use **Buy credits**, then
-   **Refresh**. The on-chain rail is on the Miden **testnet**, so that wallet
-   also needs test tokens of the operator's faucet.
+   **Refresh**. The on-chain rail is on the Miden **testnet**; the test token
+   is the wallet's built-in USDT test faucet (free mint from the wallet).
 
 Note: React escapes interpolated text by default, so server-provided strings
 (model ids, error messages) can't inject markup.
@@ -81,53 +77,33 @@ Note: React escapes interpolated text by default, so server-provided strings
 ## On-chain top-up (pay with the wallet itself)
 
 The Top up panel has two rails. **⛓ Wallet (on-chain)** — the default — pays
-straight from the connected Leviathan wallet: the app asks the Edge for a
-quote, then `payTopup()` submits one wallet Custom transaction — a public
-P2ID note paying the EXACT quoted amount and carrying the **order memo as a
-`NoteAttachment`** — waits for the on-chain commit, and `waitForTopup()`
-polls until the operator's note-watcher credits the ledger. The panel walks
-① quote/sign → ② commit → ③ credit. **💳 Card (Stripe)** keeps the old
-hosted-checkout tab.
+straight from the connected Leviathan wallet, walking ① quote/sign →
+② commit → ③ credit. **💳 Card (Stripe)** keeps the old hosted-checkout tab.
 
-### The memo lives ON the note — built by the server, client fallback kept
+### The server builds the transaction
 
-The normal path needs no SDK in the page: `createTopup` sends the
-connected account's address, the **server** builds the transaction (its
-`note-builder` runs the same SDK build and the same memo codec as the
-watcher that later reads the note) and returns it as
-`onchain.custom_tx`; `payTopup` hands it to
-`wallet.requestTransaction({type: 'Custom'})` (`paid.source === 'server'`
-— the status line says which path paid). The transaction is bound to the
-account that created the order: switching wallet accounts in between
-gives `sender_mismatch` before anything moves, and the next click's
-`retryCheckout` prepares it for the current account.
+`createTopup({ provider: 'onchain' })` sends the connected account's
+address; the **server** builds the exact transaction — a public P2ID note
+paying the quoted amount and carrying the **order memo as a
+`NoteAttachment`** — and returns it as `onchain.custom_tx`. `payTopup(order)`
+hands it to `wallet.requestTransaction({type: 'Custom'})`; the wallet only
+signs and publishes. The status line says `server-built payload` so a test
+run proves which path paid.
 
-`src/onchain-attach.js` is the **fallback** (`paid.source === 'client'`),
-used only for an order the server returned without `custom_tx`: it
-creates the P2ID note itself with `@miden-sdk/miden-sdk`, embeds the
-memo as a `NoteAttachment` (scheme `0x4C565431` "LVT1" — codec kept in
-lockstep with `note-watcher/src/core.mjs`), serializes and submits it the
-same way. The memo is the ONLY thing that matches the payment to the
-order, so there is **no plain-send fallback**: if the SDK can't load,
-`payTopup` throws `attachment_unavailable` before any money moves. The
-two requirements below apply to this fallback only:
+Why the memo lives on the note: it is the ONLY thing that matches a payment
+to an order (amounts are plain prices and collide across same-price
+orders). Why the server builds it: the wallet's plain send has no slot for
+an attachment, someone has to produce the serialized transaction, and doing
+it server-side keeps the memo codec in one place (next to the watcher that
+decodes it) and keeps every Miden dependency out of the frontend.
 
-- **Registry**: the SDK comes from the private Gitea npm registry
-  (`.npmrc`), version-pinned to the exact build the wallet extension
-  bundles (`0.15.0-node.5e72c326`) — a different build produces notes the
-  wallet refuses to sign. The registry **refuses anonymous reads** (`401`),
-  so `GITEA_NPM_TOKEN` must hold a Gitea PAT with the `read:package` scope,
-  exported before `npm install` and set as a build variable wherever this
-  is built. It is a build-time credential only; it never reaches the bundle.
-- **Cross-origin isolation**: the SDK's multi-threaded WASM needs
-  SharedArrayBuffer, so the page must send
-  `Cross-Origin-Opener-Policy: same-origin` and
-  `Cross-Origin-Embedder-Policy: require-corp`. Wired for `npm run
-  dev`/`preview` (vite.config.js) and `npm start` (public/serve.json —
-  Vite copies it to `dist/serve.json`, where `serve` picks it up); any
-  other host must send the same two headers. `crossOriginIsolated` must be
-  `true` in the deployed tab, or the on-chain rail is unavailable (Stripe
-  still works).
+The payload is **bound to the account that created the order** — a Miden
+note names its sender and the wallet signs only for its own account. If the
+user switches wallet accounts in between, `payTopup` throws
+`sender_mismatch` before anything moves; the next click's `retryCheckout`
+prepares the order for the current account. If the server returns no
+payload at all (builder not configured), `payTopup` throws `config` —
+fail closed, nothing is spent.
 
 ### The three guards in `onTopup`
 
@@ -143,9 +119,11 @@ out of paying:
 2. **Reuse an unpaid order, don't mint another.** A closed tab or a declined
    popup leaves a pending order holding a capped slot (8 on-chain / 24h, 16
    card / 30 days) that only an operator can cancel. The next click calls
-   `retryCheckout({memo})`; `topup_not_pending` means it is paid or expired
-   and a new order is right. Any other failure **stops** — falling through to
-   `createTopup` would spend a slot behind the user's back.
+   `retryCheckout({memo})` — which returns the **same** stored transaction,
+   so retrying never creates a second payable note; `topup_not_pending`
+   means it is paid or expired and a new order is right. Any other failure
+   **stops** — falling through to `createTopup` would spend a slot behind
+   the user's back.
 3. **Branch on the rail the server chose**, `order.provider`, never the one
    requested. The operator can route every top-up onto one rail and an
    order's rail is fixed for life, so a client that trusts its own request
