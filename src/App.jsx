@@ -20,6 +20,9 @@ function explain(e) {
       // than the one now connected. The order is kept, so the next click's
       // retryCheckout prepares it for the current account.
       sender_mismatch: 'Your wallet account changed since this order was created — press Buy credits again to pay from the current account.',
+      // No prepared transaction on the order yet; the order is kept and the
+      // next click's retryCheckout has the server prepare it.
+      payload_missing: 'Preparing your on-chain payment — press Buy credits again.',
     };
     return hints[e.type] || `${e.message} (${e.type})`;
   }

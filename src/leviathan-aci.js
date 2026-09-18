@@ -285,18 +285,27 @@ export class LeviathanACI {
    * @param {string} [opts.provider] 'stripe' (default) or 'onchain'
    * @returns {Promise<{invoiceUrl: string|null, memo: string, amountCents: number|null, onchain: object|null, checkoutError: string|null, raw: object}>}
    */
+  /**
+   * Create a top-up order. `senderAddress` (default: the connected
+   * account) is sent on EVERY rail — see the note inside: the server may
+   * put the order on-chain regardless of `provider`.
+   */
   async createTopup({ credits, provider = 'stripe',
                       senderAddress = this._account?.address ?? null } = {}) {
     if (!Number.isInteger(credits) || credits <= 0) {
       throw new AciError('config', 'credits must be a positive integer');
     }
-    // On-chain: name the paying account so the SERVER builds the wallet
-    // payload (onchain.custom_tx) — the page then needs no Miden SDK.
-    // A Miden note names its sender and the wallet signs only for its
-    // own account, so this must be the account that will approve it:
-    // the connected one, by default.
+    // Always name the paying account when connected — NOT only when we
+    // asked for on-chain. The operator can route every top-up onto one
+    // rail (TOPUP_PROVIDER_OVERRIDE), so an order we asked to put on
+    // Stripe may land on-chain; without the sender the server cannot
+    // build its wallet payload and the first payTopup fails. The server
+    // ignores the field on the Stripe rail. The address lets the server
+    // build the payload (onchain.custom_tx) so the page needs no Miden
+    // SDK; a Miden note names its sender and the wallet signs only for
+    // its own account, so this is the connected account by default.
     const body = { credits, provider };
-    if (provider === 'onchain' && senderAddress) body.sender_address = senderAddress;
+    if (senderAddress) body.sender_address = senderAddress;
     const res = await this.signedFetch('/v1/wallet/payment-intents',
       { body: JSON.stringify(body) });
     if (!res.ok) throw await toError(res);
@@ -447,10 +456,14 @@ export class LeviathanACI {
       }
       source = 'client';
     } else {
-      throw new AciError('config',
-        'no wallet payload: the server returned no onchain.custom_tx (was the '
-        + 'order created with a connected wallet, and is ONCHAIN_BUILDER_URL set '
-        + 'on the server?) and no buildCustomTx fallback was given');
+      // An on-chain order with no prepared payload: created by an older
+      // client, or before the wallet was connected. Recoverable —
+      // retryCheckout({memo}) sends the connected account and the server
+      // prepares the payload — so say that, not "misconfigured".
+      throw new AciError('payload_missing',
+        'this order has no prepared wallet payload yet — call '
+        + 'retryCheckout({memo}) to have the server prepare it for the '
+        + 'connected account, then pay again');
     }
     const r = await this._wallet.requestTransaction({ type: 'Custom', payload });
     const transactionId = r?.transactionId;
