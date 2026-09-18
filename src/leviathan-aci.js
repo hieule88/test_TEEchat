@@ -336,11 +336,14 @@ export class LeviathanACI {
    * it expires (30 days on the card rail). Minting a fresh order per
    * click is how a user locks themselves out of paying at all.
    *
-   * Talks to auth-service directly (like waitForTopup) because the
-   * endpoint is public read-mostly: holding the memo only ever lets you
-   * ask for instructions, and paying them credits the order's original
-   * owner. The order's RAIL is fixed at creation — this rebuilds that
-   * rail's instructions and cannot move it to another.
+   * With an open session this goes through the Edge, signed: that is
+   * what lets the server (re)prepare the on-chain wallet payload for the
+   * connected account — a write the ledger only performs for the order
+   * owner. Without a session it falls back to auth-service's public,
+   * READ-ONLY route (like waitForTopup): holding the memo only ever lets
+   * you re-read stored instructions, and paying them credits the order's
+   * original owner. The order's RAIL is fixed at creation — this rebuilds
+   * that rail's instructions and cannot move it to another.
    *
    * @param {object} opts
    * @param {string} opts.memo          memo from the original createTopup()
@@ -352,20 +355,32 @@ export class LeviathanACI {
   async retryCheckout({ memo, authOrigin = this.authOrigin,
                         senderAddress = this._account?.address ?? null } = {}) {
     if (!memo) throw new AciError('config', 'memo is required');
-    if (!authOrigin) {
-      throw new AciError('config',
-        "authOrigin is required (auth-service base URL, e.g. 'https://leviathan-auth.duckdns.org')");
+    let res;
+    if (this._session) {
+      // With a session: through the Edge, SIGNED. The Edge vouches for the
+      // order owner, which is what lets the server (re)prepare the wallet
+      // payload for the connected account — the public route is read-only
+      // for that (anyone holding a memo could otherwise drive the builder,
+      // since memos are public on-chain once a note commits).
+      // No provider: "this order's own rail".
+      const body = senderAddress ? { sender_address: senderAddress } : {};
+      res = await this.signedFetch(`/v1/wallet/payment-intents/${memo}/checkout`,
+        { body: JSON.stringify(body) });
+    } else {
+      // No session: the public, read-only route on auth-service. It hands
+      // back whatever instructions are stored; it will not prepare a
+      // payload for a new account (that needs the session path above).
+      if (!authOrigin) {
+        throw new AciError('config',
+          "authOrigin is required (auth-service base URL, e.g. 'https://leviathan-auth.duckdns.org')");
+      }
+      const base = authOrigin.replace(/\/+$/, '');
+      res = await this._fetch(`${base}/v1/payment-intents/${memo}/checkout`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: '{}',
+      });
     }
-    const base = authOrigin.replace(/\/+$/, '');
-    // No provider: "this order's own rail". The sender lets the server
-    // hand back the payload it stored for this account, or build one for
-    // a different account the user switched to (see createTopup).
-    const body = senderAddress ? { sender_address: senderAddress } : {};
-    const res = await this._fetch(`${base}/v1/payment-intents/${memo}/checkout`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(body),
-    });
     if (res.status === 404 || res.status === 409) {
       throw new AciError('topup_not_pending',
         `order ${memo} can no longer be paid — create a new top-up`, res.status);
