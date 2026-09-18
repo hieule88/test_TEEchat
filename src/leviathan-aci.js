@@ -403,33 +403,28 @@ export class LeviathanACI {
    *
    * The payment MUST carry the intent memo on the note itself: matching
    * is memo-only (amounts are plain prices and collide across same-price
-   * orders), so `buildCustomTx` is REQUIRED — an app-provided async
-   * builder (see onchain-attach.js) that bundles @miden-sdk and returns
-   * the payload for wallet.requestTransaction({type:'Custom'}): a
-   * serialized P2ID transaction paying the exact quoted amount with the
-   * memo as a NoteAttachment. The builder stays app-side so this SDK
-   * remains zero-dependency.
+   * orders). The SERVER builds that transaction — a serialized P2ID note
+   * paying the exact quoted amount with the memo as a NoteAttachment —
+   * and returns it as `onchain.custom_tx` when the order is created (the
+   * SDK sends the connected account's address for it). This method only
+   * hands it to wallet.requestTransaction({type:'Custom'}); the page
+   * needs no Miden SDK and this file stays zero-dependency.
    *
    * There is deliberately NO fallback to the wallet's plain
    * requestSend(): a memo-less payment cannot be auto-credited — the
-   * money would arrive and park as an ops case. If the builder fails
-   * (the WASM SDK won't load — e.g. the page is not cross-origin
-   * isolated), payTopup throws 'attachment_unavailable' BEFORE any
-   * money moves; fix the deployment rather than paying blind.
+   * money would arrive and park as an ops case. An order without a
+   * prepared payload throws 'payload_missing' BEFORE any money moves
+   * (recover with retryCheckout({memo}) under an open session).
    *
-   * @param {object} topup  the createTopup() result (or any object with `.onchain`)
+   * @param {object} topup  the createTopup()/retryCheckout() result (or any object with `.onchain`)
    * @param {object} [opts]
    * @param {boolean} [opts.waitForCommit=true]   also wait for the tx to commit on-chain
-   * @param {(args: {senderAddress: string, onchain: object}) => Promise<object>} [opts.buildCustomTx]
-   *        Fallback builder for orders WITHOUT a server-built payload (see below).
-   * @returns {Promise<{transactionId: string, memo: string, commit: object|null, viaAttachment: true, source: 'server'|'client'}>}
-   *          `source` says who built the payload: 'server' (onchain.custom_tx,
-   *          the normal case) or 'client' (the buildCustomTx fallback).
+   * @returns {Promise<{transactionId: string, memo: string, commit: object|null, viaAttachment: true}>}
    *          `commit` is the wallet's waitForTransaction output (txHash, outputNotes)
    *          when waitForCommit, else null. On-chain commit ≠ credited: follow with
    *          waitForTopup() for the ledger side.
    */
-  async payTopup(topup, { waitForCommit = true, buildCustomTx = null } = {}) {
+  async payTopup(topup, { waitForCommit = true } = {}) {
     const oc = topup?.onchain ?? topup?.raw?.onchain ?? null;
     if (!oc) {
       throw new AciError('config',
@@ -438,7 +433,6 @@ export class LeviathanACI {
     if (!this._wallet) throw new AciError('wallet_missing', 'Leviathan wallet extension not found');
     if (!this.connected) throw new AciError('not_connected', 'call connect() first');
     let payload;
-    let source;
     const served = oc.custom_tx;
     if (served?.transactionRequest && served?.address) {
       // The SERVER built the payload (the order was created with this
@@ -457,19 +451,6 @@ export class LeviathanACI {
         recipientAddress: served.recipientAddress ?? oc.pay_to_address,
         transactionRequest: served.transactionRequest,
       };
-      source = 'server';
-    } else if (typeof buildCustomTx === 'function') {
-      // Legacy/fallback: the page bundles the Miden SDK and builds the
-      // note itself (see onchain-attach.js). Needs a cross-origin-isolated
-      // page for the SDK's WASM.
-      try {
-        payload = await buildCustomTx({ senderAddress: this._account.address, onchain: oc });
-      } catch (e) {
-        throw new AciError('attachment_unavailable',
-          'cannot build the memo-carrying transaction (is the page '
-          + `cross-origin-isolated and @miden-sdk installed?): ${e?.message ?? e}`);
-      }
-      source = 'client';
     } else {
       // An on-chain order with no prepared payload: created by an older
       // client, or before the wallet was connected. Recoverable —
@@ -494,7 +475,7 @@ export class LeviathanACI {
         throw new AciError('onchain_tx_failed', commit.errorMessage);
       }
     }
-    return { transactionId, memo: oc.memo ?? topup.memo, commit, viaAttachment, source };
+    return { transactionId, memo: oc.memo ?? topup.memo, commit, viaAttachment };
   }
 
   /**

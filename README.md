@@ -87,8 +87,9 @@ address; the **server** builds the exact transaction — a public P2ID note
 paying the quoted amount and carrying the **order memo as a
 `NoteAttachment`** — and returns it as `onchain.custom_tx`. `payTopup(order)`
 hands it to `wallet.requestTransaction({type: 'Custom'})`; the wallet only
-signs and publishes. The status line says `server-built payload` so a test
-run proves which path paid.
+signs and publishes. The status line shows the wallet's transaction id once
+the note is committed; there is no other way to pay — the SDK has no
+client-side builder.
 
 Why the memo lives on the note: it is the ONLY thing that matches a payment
 to an order (amounts are plain prices and collide across same-price

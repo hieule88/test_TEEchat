@@ -279,8 +279,7 @@ export default function App() {
       setPendingOrder({ wanted, provider: 'onchain', memo: order.memo,
                         credits: c, paidTx: paid.transactionId });
       setTopupStep('credit');
-      notify('ok', `Payment committed on-chain (${paid.source === 'server'
-        ? 'server-built payload' : 'client-built payload'}) — waiting for the credit…`);
+      notify('ok', `Payment committed on-chain (tx ${short(paid.transactionId)}) — waiting for the credit…`);
       await waitForCredit(order.memo);
     } catch (e) {
       if (e instanceof AciError && e.type === 'topup_timeout') {
