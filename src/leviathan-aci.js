@@ -62,6 +62,48 @@ const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
 const utf8 = s => new TextEncoder().encode(s);
 const sha256 = async b => hex(await crypto.subtle.digest('SHA-256', b));
 const randPriv = c => (c.utils.randomSecretKey ?? c.utils.randomPrivateKey)();
+const unhex = s => Uint8Array.from((s.replace(/^0x/, '').match(/.{2}/g) ?? []).map(h => parseInt(h, 16)));
+
+// ─── E2EE v2 (ACI §7, X25519 suite) ───────────────────────────────────────────
+// Every primitive is Web Crypto except the curve, which comes from the same
+// @noble import the wallet binding already uses — no new dependency.
+const E2EE_SUITE = 'x25519-aes-256-gcm-hkdf-sha256';
+const E2EE_HKDF_INFO = 'aci.e2ee.v2.x25519';
+const E2EE_REQUEST_PURPOSE = 'aci.e2ee.request.v2';
+const E2EE_RESPONSE_PURPOSE = 'aci.e2ee.response.v2';
+
+async function e2eeAesKey(sharedSecret) {
+  const ikm = await crypto.subtle.importKey('raw', sharedSecret, 'HKDF', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt: new Uint8Array(0), info: utf8(E2EE_HKDF_INFO) }, ikm, 256);
+  return crypto.subtle.importKey('raw', bits, 'AES-GCM', false, ['encrypt', 'decrypt']);
+}
+
+/** Encrypt one field to the service key. Wire: eph_pub(32) || nonce(12) || ct || tag(16), hex. */
+async function e2eeSeal(servicePubHex, plaintext, aad) {
+  const eph = randPriv(x25519);
+  const key = await e2eeAesKey(x25519.getSharedSecret(eph, unhex(servicePubHex)));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const ct = new Uint8Array(await crypto.subtle.encrypt(
+    { name: 'AES-GCM', iv, additionalData: aad, tagLength: 128 }, key, utf8(plaintext)));
+  const out = new Uint8Array(32 + 12 + ct.length);
+  out.set(x25519.getPublicKey(eph), 0); out.set(iv, 32); out.set(ct, 44);
+  return hex(out);
+}
+
+/** Decrypt one response field encrypted to our client key. */
+async function e2eeOpen(clientPriv, blobHex, aad) {
+  const blob = unhex(blobHex);
+  if (blob.length < 32 + 12 + 16) throw new AciError('e2ee_bad_ciphertext', 'response field too short to be E2EE ciphertext');
+  const key = await e2eeAesKey(x25519.getSharedSecret(clientPriv, blob.slice(0, 32)));
+  try {
+    const pt = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: blob.slice(32, 44), additionalData: aad, tagLength: 128 }, key, blob.slice(44));
+    return new TextDecoder().decode(pt);
+  } catch {
+    throw new AciError('e2ee_decrypt_failed', 'could not decrypt the response field (wrong key, AAD, or tampering)');
+  }
+}
 
 /** JCS (RFC 8785) over integer-only objects — same subset the Edge uses.
  *  Exported so a frontend can canonicalize/verify a statement if it wants. */
@@ -254,20 +296,122 @@ export class LeviathanACI {
    * and parse the `data:` chunks.
    * @returns {Promise<{content: string, receiptId: string|null, raw: object}>}
    */
-  async chat({ model, messages, stream, ...rest }) {
+  async chat({ model, messages, stream, e2ee = true, ...rest }) {
     if (stream) {
       throw new AciError('config',
         'streaming is not supported by chat() — use signedFetch() and parse the SSE yourself');
     }
-    const res = await this.signedFetch('/v1/chat/completions',
-      { body: JSON.stringify({ model, messages, ...rest }) });
+    if (typeof model !== 'string' || !model) throw new AciError('config', 'model is required');
+
+    if (!e2ee) {
+      const res = await this.signedFetch('/v1/chat/completions',
+        { body: JSON.stringify({ model, messages, ...rest }) });
+      if (!res.ok) throw await toError(res);
+      const raw = await res.json();
+      return {
+        content: raw.choices?.[0]?.message?.content ?? null,
+        reasoningContent: raw.choices?.[0]?.message?.reasoning_content ?? null,
+        receiptId: res.headers.get('x-receipt-id'),
+        raw, e2ee: false,
+      };
+    }
+
+    // ── E2EE v2 (ACI §7): every content-bearing field is encrypted to the
+    // workload's attested key, so the Edge relays only ciphertext. Text
+    // AND image parts alike — a photo is as confidential as a sentence.
+    const serviceKey = await this._e2eeServiceKey();
+    const nonce = hex(crypto.getRandomValues(new Uint8Array(32)));
+    const ts = Math.floor(Date.now() / 1000);
+    const clientPriv = randPriv(x25519);           // the reply is encrypted to this
+    const aad = (field) => utf8(jcs({
+      purpose: E2EE_REQUEST_PURPOSE, algo: E2EE_SUITE, model, field, nonce, ts }));
+
+    const sealed = await Promise.all(messages.map(async (m, mi) => {
+      const { content } = m;
+      const base = `messages.${mi}.content`;
+      if (typeof content === 'string') {
+        return { ...m, content: await e2eeSeal(serviceKey, content, aad(base)) };
+      }
+      if (Array.isArray(content)) {
+        // §7.2 per-part form for the part types the gateway decrypts in place.
+        const supported = content.every((p) => p?.type === 'text' || p?.type === 'image_url');
+        if (!supported) {
+          // Universal form: the whole array serialized, one ciphertext. The
+          // gateway restores it as structured content.
+          return { ...m, content: await e2eeSeal(serviceKey, JSON.stringify(content), aad(base)) };
+        }
+        return { ...m, content: await Promise.all(content.map(async (p, ci) => (
+          p.type === 'text'
+            ? { ...p, text: await e2eeSeal(serviceKey, String(p.text ?? ''), aad(`${base}.${ci}.text`)) }
+            : { ...p, image_url: { ...p.image_url,
+                url: await e2eeSeal(serviceKey, String(p.image_url?.url ?? ''), aad(`${base}.${ci}.image_url.url`)) } }
+        ))) };
+      }
+      return m;   // null/absent content passes through (spec: non-strings are not encrypted)
+    }));
+
+    const res = await this.signedFetch('/v1/chat/completions', {
+      body: JSON.stringify({ model, messages: sealed, ...rest }),
+      headers: {
+        'x-e2ee-version': '2',
+        'x-model-pub-key': serviceKey,
+        'x-client-pub-key': hex(x25519.getPublicKey(clientPriv)),
+        'x-e2ee-nonce': nonce,
+        'x-e2ee-timestamp': String(ts),
+      },
+    });
     if (!res.ok) throw await toError(res);
+    if (res.headers.get('x-e2ee-applied') !== 'true') {
+      // The gateway did not confirm it decrypted our fields: something in
+      // between stripped the headers or served plaintext. Refuse to treat
+      // the reply as confidential.
+      throw new AciError('e2ee_not_applied',
+        'the gateway did not confirm end-to-end encryption (x-e2ee-applied missing) — '
+        + 'the Edge may be stripping x-e2ee-* headers');
+    }
     const raw = await res.json();
+    const id = typeof raw.id === 'string' ? raw.id : '';
+    const responseAad = (field) => utf8(jcs({
+      purpose: E2EE_RESPONSE_PURPOSE, algo: E2EE_SUITE, model, id, field, nonce, ts }));
+    for (const [pos, choice] of (raw.choices ?? []).entries()) {
+      const idx = Number.isInteger(choice?.index) ? choice.index : pos;
+      const msg = choice?.message;
+      if (!msg) continue;
+      for (const key of ['content', 'reasoning_content']) {
+        if (typeof msg[key] === 'string' && msg[key]) {
+          msg[key] = await e2eeOpen(clientPriv, msg[key], responseAad(`choices.${idx}.message.${key}`));
+        }
+      }
+    }
     return {
       content: raw.choices?.[0]?.message?.content ?? null,
+      reasoningContent: raw.choices?.[0]?.message?.reasoning_content ?? null,
       receiptId: res.headers.get('x-receipt-id'),
-      raw,
+      raw, e2ee: true,
     };
+  }
+
+  /**
+   * The workload's E2EE public key (X25519 suite) from the attestation
+   * report the Edge passes through publicly. Cached briefly: the key is
+   * stable for the life of the workload, and one fetch per message would
+   * double every round trip.
+   */
+  async _e2eeServiceKey() {
+    const c = this._e2eeKeyCache;
+    if (c && Date.now() - c.at < 10 * 60_000) return c.key;
+    const nonce = hex(crypto.getRandomValues(new Uint8Array(32)));
+    const res = await this._fetch(`${this.serviceOrigin}/v1/attestation/report?nonce=${nonce}`);
+    if (!res.ok) throw await toError(res);
+    const report = await res.json();
+    const entry = (report?.attestation?.workload_keyset?.e2ee_public_keys ?? [])
+      .find((k) => k?.algo === E2EE_SUITE && typeof k.public_key === 'string');
+    if (!entry) {
+      throw new AciError('e2ee_no_key',
+        `the attestation report carries no ${E2EE_SUITE} E2EE key`);
+    }
+    this._e2eeKeyCache = { key: entry.public_key.replace(/^0x/, ''), at: Date.now() };
+    return this._e2eeKeyCache.key;
   }
 
   /**
