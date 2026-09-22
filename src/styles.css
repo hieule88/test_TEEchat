@@ -78,3 +78,7 @@ aside h3 { margin: 0 0 8px; font-size: 12px; letter-spacing: .04em; text-transfo
 .balance .unit { font-size: 13px; color: var(--muted); font-weight: 400; }
 .hint { font-size: 12px; color: var(--muted); margin-top: 8px; }
 @media (max-width: 760px) { aside { display: none; } }
+
+/* image attachments (vision) */
+.msg .thumb { display: block; max-width: 260px; max-height: 180px; border-radius: 8px; margin-bottom: 6px; }
+button.ghost.on { border-color: var(--accent, #6b8afd); }

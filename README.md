@@ -74,6 +74,31 @@ so a Railway variable silently wins over the committed `.env` — check the
 Note: React escapes interpolated text by default, so server-provided strings
 (model ids, error messages) can't inject markup.
 
+## Confidential chat: E2EE by default, images included
+
+`aci.chat()` encrypts every message to the enclave's attested key (ACI §7,
+E2EE v2 — X25519 + HKDF-SHA256 + AES-256-GCM, all Web Crypto plus the
+`@noble` curve the wallet binding already imports) and decrypts the reply
+here. The Edge relays ciphertext; the gateway confirms with
+`x-e2ee-applied: true`, and the SDK throws `e2ee_not_applied` otherwise.
+
+**Vision.** Models whose `/v1/models` entry lists `"image"` in
+`input_modalities` (`glm-5.3-flash`, `qwen3.8-27b`; the Edge decorates the
+list from `EDGE_MODEL_INPUT_MODALITIES`) get a 📎 button. The picture is read
+with `FileReader` into a `data:` URL — never a remote URL, which would make
+the upstream fetch it from a host that then knows what you asked — sent as
+an OpenAI content-parts message, and **each part (the text and the image)
+is a separate ciphertext** bound to its field path
+(`messages.{m}.content.{c}.image_url.url`). Limit 6 MB per image (the
+gateway caps bodies at 32 MB). Switching to a text-only model drops a staged
+image with a notice. Both vision models reason before answering, so the
+app never sets a small `max_tokens` — with one, `content` comes back `null`
+and only `reasoningContent` is filled.
+
+The end-to-end proof for this path (encrypted image through the Edge,
+decrypted only inside the enclave, correct description back) is
+`leviathan-ai-gateway-verify/example_e2ee_vision.mjs`.
+
 ## On-chain top-up (pay with the wallet itself)
 
 The Top up panel has two rails. **⛓ Wallet (on-chain)** — the default — pays

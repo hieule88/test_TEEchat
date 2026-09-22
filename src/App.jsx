@@ -1,4 +1,4 @@
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { aci, AciError, MAX_SPEND } from './aci';
 
 // React escapes all interpolated text ({value}) by default, so server-provided
@@ -20,6 +20,10 @@ function explain(e) {
       // than the one now connected. The order is kept, so the next click's
       // retryCheckout prepares it for the current account.
       sender_mismatch: 'Your wallet account changed since this order was created — press Buy credits again to pay from the current account.',
+      // E2EE: the gateway must confirm it decrypted our fields; otherwise the
+      // message may have travelled in plaintext somewhere and we say so.
+      e2ee_not_applied: 'The gateway did not confirm end-to-end encryption — message not sent as confidential. Tell the operator.',
+      e2ee_no_key: 'The attestation report has no E2EE key — cannot encrypt to the enclave. Tell the operator.',
       // No prepared transaction on the order yet; the order is kept and the
       // next click's retryCheckout has the server prepare it.
       payload_missing: 'Preparing your on-chain payment — press Buy credits again.',
@@ -33,8 +37,16 @@ export default function App() {
   // aci holds the real state; these mirror it so React re-renders.
   const [account, setAccount] = useState(null);
   const [session, setSession] = useState(null);
+  // Model objects from /v1/models — the Edge decorates each with
+  // `input_modalities`, which is what gates the image-attach button.
   const [models, setModels] = useState([]);
   const [model, setModel] = useState('');
+  // A pending image for the next message: { name, dataUrl, bytes }. Kept as a
+  // data URL on purpose — a remote URL would make the upstream fetch it, and
+  // that host would learn someone is asking an AI about this picture.
+  const [attachment, setAttachment] = useState(null);
+  const fileRef = useRef(null);
+  const MAX_IMAGE_BYTES = 6 * 1024 * 1024;   // ~8 MB as base64; the gateway caps bodies at 32 MB
   const [messages, setMessages] = useState([
     { role: 'ai', text: '👋 Connect your Leviathan wallet, open a session, then chat. Every message is signed by your wallet — no API key.' },
   ]);
@@ -81,12 +93,40 @@ export default function App() {
   }, []);
 
   const loadModels = useCallback(async () => {
-    let ids = [];
-    try { ids = (await aci.models()).map((m) => m.id).filter(Boolean); } catch { /* ignore */ }
-    if (!ids.length) ids = ['gpt-oss-120b'];
-    setModels(ids);
-    setModel(ids[0]);
+    let list = [];
+    try {
+      list = (await aci.models())
+        .filter((m) => m && typeof m.id === 'string')
+        .map((m) => ({ id: m.id, input_modalities: Array.isArray(m.input_modalities) ? m.input_modalities : ['text'] }));
+    } catch { /* ignore */ }
+    if (!list.length) list = [{ id: 'glm-5.3-flash', input_modalities: ['text', 'image'] }];
+    setModels(list);
+    setModel(list[0].id);
   }, []);
+
+  const modelInfo = models.find((m) => m.id === model);
+  const canAttach = (modelInfo?.input_modalities ?? ['text']).includes('image');
+
+  // Switching to a text-only model while an image is staged: drop it and say so,
+  // rather than sending a request the model cannot serve.
+  useEffect(() => {
+    if (attachment && !canAttach) {
+      setAttachment(null);
+      notify('warn', `${model} does not accept images — attachment removed.`);
+    }
+  }, [attachment, canAttach, model, notify]);
+
+  const onPickImage = useCallback((e) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    if (!file.type.startsWith('image/')) return notify('err', 'Only image files can be attached.');
+    if (file.size > MAX_IMAGE_BYTES) return notify('err', `Image too large (${(file.size / 1e6).toFixed(1)} MB) — limit 6 MB.`);
+    const reader = new FileReader();
+    reader.onload = () => setAttachment({ name: file.name, dataUrl: String(reader.result), bytes: file.size });
+    reader.onerror = () => notify('err', 'Could not read the image.');
+    reader.readAsDataURL(file);
+  }, [notify]);
 
   const onConnectOrOpen = useCallback(async () => {
     setBusy(true);
@@ -113,12 +153,20 @@ export default function App() {
   const onSend = useCallback(async (e) => {
     e.preventDefault();
     const text = prompt.trim();
-    if (!text) return;
+    const image = attachment;
+    if (!text && !image) return;
     setPrompt('');
-    setMessages((m) => [...m, { role: 'user', text }, { role: 'ai', text: '…', pending: true }]);
+    setAttachment(null);
+    setMessages((m) => [...m, { role: 'user', text, image: image?.dataUrl ?? null }, { role: 'ai', text: '…', pending: true }]);
     setBusy(true);
-    // Send the WHOLE conversation so the model has context.
-    const outgoing = [...historyRef.current, { role: 'user', content: text }];
+    // Send the WHOLE conversation so the model has context. With an image the
+    // turn is OpenAI content parts; the SDK encrypts each part (text AND the
+    // image data URL) to the enclave key before anything leaves this page.
+    const userContent = image
+      ? [{ type: 'text', text: text || 'Describe this image.' },
+         { type: 'image_url', image_url: { url: image.dataUrl } }]
+      : text;
+    const outgoing = [...historyRef.current, { role: 'user', content: userContent }];
     try {
       // Only include the flag when on: an older gateway would forward an
       // unknown top-level field to the upstream, which may reject it.
@@ -147,6 +195,7 @@ export default function App() {
       });
       aci.refreshBalance().then(sync).catch(() => {});
     } catch (err) {
+      if (image) setAttachment(image);   // a failed turn is dropped; give the image back
       setMessages((m) => {
         const copy = [...m];
         copy[copy.length - 1] = { role: 'ai', text: `⚠ ${explain(err)}`, error: true };
@@ -155,7 +204,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [prompt, model, webSearch, sync]);
+  }, [prompt, attachment, model, webSearch, sync]);
 
   const onRefresh = useCallback(async () => {
     try { await aci.refreshBalance(); sync(); notify('ok', 'Balance refreshed'); }
@@ -343,6 +392,7 @@ export default function App() {
           <div className="messages">
             {messages.map((m, i) => (
               <div key={i} className={`msg ${m.role === 'user' ? 'user' : 'ai'}`} style={m.error ? { color: 'var(--err)' } : undefined}>
+                {m.image && <img className="thumb" src={m.image} alt="attached image" />}
                 {m.text}
                 {m.webSearches && (
                   <span className="meta egress">
@@ -370,8 +420,27 @@ export default function App() {
 
           <form className="composer" onSubmit={onSend}>
             <select value={model} onChange={(e) => setModel(e.target.value)} disabled={!inSession} title="Model">
-              {models.map((id) => <option key={id} value={id}>{id}</option>)}
+              {models.map((m) => (
+                <option key={m.id} value={m.id}>
+                  {m.id}{m.input_modalities.includes('image') ? ' 👁' : ''}
+                </option>
+              ))}
             </select>
+            <input ref={fileRef} type="file" accept="image/*" hidden onChange={onPickImage} />
+            <button
+              type="button"
+              className={`ghost ${attachment ? 'on' : ''}`}
+              onClick={() => fileRef.current?.click()}
+              disabled={!inSession || busy || !canAttach}
+              title={canAttach
+                ? 'Attach an image. It is sent as a data URL and encrypted end-to-end to the enclave — the Edge never sees it, and no third-party host is asked to serve it.'
+                : `${model} accepts text only — pick a model marked 👁 to attach an image.`}
+            >
+              📎 {attachment ? attachment.name.slice(0, 18) : 'Image'}
+            </button>
+            {attachment && (
+              <button type="button" className="ghost tiny" onClick={() => setAttachment(null)} title="Remove image">✕</button>
+            )}
             <button
               type="button"
               className={`ghost toggle ${webSearch ? 'on' : ''}`}
