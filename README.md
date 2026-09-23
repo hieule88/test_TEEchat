@@ -89,11 +89,33 @@ with `FileReader` into a `data:` URL — never a remote URL, which would make
 the upstream fetch it from a host that then knows what you asked — sent as
 an OpenAI content-parts message, and **each part (the text and the image)
 is a separate ciphertext** bound to its field path
-(`messages.{m}.content.{c}.image_url.url`). Limit 6 MB per image (the
-gateway caps bodies at 32 MB). Switching to a text-only model drops a staged
-image with a notice. Both vision models reason before answering, so the
-app never sets a small `max_tokens` — with one, `content` comes back `null`
-and only `reasoningContent` is filled.
+(`messages.{m}.content.{c}.image_url.url`). Switching to a text-only model
+drops a staged image with a notice. Both vision models reason before
+answering, so the app never sets a small `max_tokens` — with one, `content`
+comes back `null` and only `reasoningContent` is filled.
+
+**Size discipline (`src/vision.js`).** Two facts compound: E2EE writes every
+field as hex, so a data URL costs *twice* its length on the wire (6 MB photo
+→ 8 MB base64 → 16 MB hex), and every turn resends the whole conversation
+— so two full-size photos in history would push every later message past
+the gateway's 32 MiB cap (413). Hence:
+
+- **Shrink before encrypting**: pictures are drawn on a canvas at ≤ 1568 px
+  on the long side and exported as JPEG 0.85 (vision models downsample to
+  that anyway; a phone photo becomes ~300–600 KB). Files ≤ 1 MB that already
+  fit are sent as-is, which keeps PNG transparency. Source cap 6 MB; result
+  cap 2 MB (more after resizing is abnormal → refused with a reason).
+- **Context budget**: before each send the estimated encrypted size of the
+  conversation is held under 8 MiB by replacing the *oldest* images with a
+  text placeholder (`[image sent earlier: name]`); the newest image always
+  stays so follow-up questions about it work. The user is told when an
+  image leaves the context, and the trimmed history is what gets kept.
+- **413 anyway** (an odd image, a huge text history): the app drops every
+  image from context and retries once — the Edge has refunded that
+  credit — and only then says "start a New chat".
+
+`npm test` pins all of this (budget, placeholders, resize decisions with a
+fake canvas).
 
 The end-to-end proof for this path (encrypted image through the Edge,
 decrypted only inside the enclave, correct description back) is

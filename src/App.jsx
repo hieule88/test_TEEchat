@@ -1,5 +1,6 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { aci, AciError, MAX_SPEND } from './aci';
+import { MAX_SOURCE_BYTES, prepareImage, stripAllImages, toWire, trimImageContext } from './vision';
 
 // React escapes all interpolated text ({value}) by default, so server-provided
 // strings (model ids, error messages, receipts) can never inject markup.
@@ -27,6 +28,10 @@ function explain(e) {
       // No prepared transaction on the order yet; the order is kept and the
       // next click's retryCheckout has the server prepare it.
       payload_missing: 'Preparing your on-chain payment — press Buy credits again.',
+      // The whole conversation is resent each turn and E2EE doubles it as hex;
+      // the gateway refuses bodies over 32 MB. The credit for a 413 is refunded.
+      // Reached only after the automatic retry without images also failed.
+      http_413: 'This conversation is too large to send even without images — start a New chat (the credit was refunded).',
     };
     return hints[e.type] || `${e.message} (${e.type})`;
   }
@@ -41,12 +46,13 @@ export default function App() {
   // `input_modalities`, which is what gates the image-attach button.
   const [models, setModels] = useState([]);
   const [model, setModel] = useState('');
-  // A pending image for the next message: { name, dataUrl, bytes }. Kept as a
-  // data URL on purpose — a remote URL would make the upstream fetch it, and
-  // that host would learn someone is asking an AI about this picture.
+  // A pending image for the next message: { name, dataUrl, bytes, width,
+  // height, resized }. Kept as a data URL on purpose — a remote URL would make
+  // the upstream fetch it, and that host would learn someone is asking an AI
+  // about this picture. Shrunk before it is ever encrypted (vision.js): E2EE
+  // writes hex, so every byte costs two on the wire.
   const [attachment, setAttachment] = useState(null);
   const fileRef = useRef(null);
-  const MAX_IMAGE_BYTES = 6 * 1024 * 1024;   // ~8 MB as base64; the gateway caps bodies at 32 MB
   const [messages, setMessages] = useState([
     { role: 'ai', text: '👋 Connect your Leviathan wallet, open a session, then chat. Every message is signed by your wallet — no API key.' },
   ]);
@@ -116,16 +122,24 @@ export default function App() {
     }
   }, [attachment, canAttach, model, notify]);
 
-  const onPickImage = useCallback((e) => {
+  const onPickImage = useCallback(async (e) => {
     const file = e.target.files?.[0];
     e.target.value = '';
     if (!file) return;
     if (!file.type.startsWith('image/')) return notify('err', 'Only image files can be attached.');
-    if (file.size > MAX_IMAGE_BYTES) return notify('err', `Image too large (${(file.size / 1e6).toFixed(1)} MB) — limit 6 MB.`);
-    const reader = new FileReader();
-    reader.onload = () => setAttachment({ name: file.name, dataUrl: String(reader.result), bytes: file.size });
-    reader.onerror = () => notify('err', 'Could not read the image.');
-    reader.readAsDataURL(file);
+    if (file.size > MAX_SOURCE_BYTES) {
+      return notify('err', `Image too large (${(file.size / 1e6).toFixed(1)} MB) — limit ${MAX_SOURCE_BYTES / 1e6} MB.`);
+    }
+    try {
+      const img = await prepareImage(file);
+      setAttachment(img);
+      if (img.resized) {
+        notify('ok', `Resized ${file.name} to ${img.width}×${img.height} — `
+          + `${(img.originalBytes / 1e6).toFixed(1)} MB → ${(img.bytes / 1e3).toFixed(0)} KB before encryption.`);
+      }
+    } catch (err) {
+      notify('err', `Could not attach ${file.name}: ${err?.message ?? err}`);
+    }
   }, [notify]);
 
   const onConnectOrOpen = useCallback(async () => {
@@ -162,24 +176,51 @@ export default function App() {
     // Send the WHOLE conversation so the model has context. With an image the
     // turn is OpenAI content parts; the SDK encrypts each part (text AND the
     // image data URL) to the enclave key before anything leaves this page.
+    // `_name` is app-only (stripped by toWire): it names the image in the
+    // placeholder once it is trimmed out of context later.
     const userContent = image
       ? [{ type: 'text', text: text || 'Describe this image.' },
-         { type: 'image_url', image_url: { url: image.dataUrl } }]
+         { type: 'image_url', image_url: { url: image.dataUrl }, _name: image.name }]
       : text;
-    const outgoing = [...historyRef.current, { role: 'user', content: userContent }];
+    const full = [...historyRef.current, { role: 'user', content: userContent }];
+    // Images in context are paid for again on every turn (the whole
+    // conversation is resent, and E2EE doubles it as hex). Keep them within a
+    // byte budget, oldest out first; the newest image always stays so a
+    // follow-up question about it still works.
+    let { messages: outgoing, dropped } = trimImageContext(full);
+    if (dropped.length) {
+      notify('warn', `Older image${dropped.length > 1 ? 's' : ''} left the conversation context to keep it sendable: ${dropped.join(', ')}.`);
+    }
     try {
       // Only include the flag when on: an older gateway would forward an
       // unknown top-level field to the upstream, which may reject it.
-      const { content, receiptId, raw } = await aci.chat({
-        model, messages: outgoing, ...(webSearch ? { web_search: true } : {}),
+      const send = (msgs) => aci.chat({
+        model, messages: toWire(msgs), ...(webSearch ? { web_search: true } : {}),
       });
+      let result;
+      try {
+        result = await send(outgoing);
+      } catch (err) {
+        // 413: the body still exceeded the gateway's cap (an outsized image,
+        // or a very long text history). The Edge refunded that credit. Drop
+        // every image from context and try once more before giving up.
+        const isTooLarge = err instanceof AciError && err.status === 413;
+        const stripped = isTooLarge ? stripAllImages(outgoing) : null;
+        if (!stripped || !stripped.dropped.length) throw err;
+        notify('warn', `The request was too large — retrying without the ${stripped.dropped.length} image${stripped.dropped.length > 1 ? 's' : ''} in context.`);
+        outgoing = stripped.messages;
+        result = await send(outgoing);
+      }
+      const { content, receiptId, raw } = result;
       // Egress disclosure from the gateway: every query the model sent out of
       // the enclave to the search service, verbatim ({query} or {raw}).
       const webSearches = webSearch && Array.isArray(raw?.web_searches)
         ? raw.web_searches.map((s) => s?.query ?? s?.raw ?? JSON.stringify(s))
         : null;
       // Commit both turns to history only on success (a failed turn is dropped
-      // so it doesn't poison later context).
+      // so it doesn't poison later context). `outgoing` — not `full` — so
+      // images trimmed out of context stay out instead of being re-trimmed
+      // (and re-announced) on every later turn.
       // Rare upstream quirk: on obscure topics the model can spend all its
       // server-side search rounds and get cut off before composing an answer
       // (empty content, queries disclosed). Tell the user what happened.
