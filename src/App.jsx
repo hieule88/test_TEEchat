@@ -1,6 +1,8 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { aci, AciError, MAX_SPEND } from './aci';
-import { MAX_SOURCE_BYTES, prepareImage, stripAllImages, toWire, trimImageContext } from './vision';
+import {
+  MAX_SOURCE_BYTES, imageTurnContent, nextImageNumber, prepareImage, stripAllImages, toWire, trimImageContext,
+} from './vision';
 
 // React escapes all interpolated text ({value}) by default, so server-provided
 // strings (model ids, error messages, receipts) can never inject markup.
@@ -134,8 +136,9 @@ export default function App() {
       const img = await prepareImage(file);
       setAttachment(img);
       if (img.resized) {
+        const fmt = img.mime === 'image/png' ? 'PNG (kept lossless)' : 'JPEG';
         notify('ok', `Resized ${file.name} to ${img.width}×${img.height} — `
-          + `${(img.originalBytes / 1e6).toFixed(1)} MB → ${(img.bytes / 1e3).toFixed(0)} KB before encryption.`);
+          + `${(img.originalBytes / 1e6).toFixed(1)} MB → ${(img.bytes / 1e3).toFixed(0)} KB ${fmt} before encryption.`);
       }
     } catch (err) {
       notify('err', `Could not attach ${file.name}: ${err?.message ?? err}`);
@@ -174,13 +177,14 @@ export default function App() {
     setMessages((m) => [...m, { role: 'user', text, image: image?.dataUrl ?? null }, { role: 'ai', text: '…', pending: true }]);
     setBusy(true);
     // Send the WHOLE conversation so the model has context. With an image the
-    // turn is OpenAI content parts; the SDK encrypts each part (text AND the
-    // image data URL) to the enclave key before anything leaves this page.
-    // `_name` is app-only (stripped by toWire): it names the image in the
-    // placeholder once it is trimmed out of context later.
+    // turn is OpenAI content parts — a numbered label ("Image 2 (x.png):"),
+    // the image, then the question — so the model can be asked about "image
+    // 2" later and the placeholder that replaces a trimmed image carries the
+    // same name. The SDK encrypts each part (text AND the image data URL) to
+    // the enclave key before anything leaves this page; the `_`-fields are
+    // app-only and stripped by toWire.
     const userContent = image
-      ? [{ type: 'text', text: text || 'Describe this image.' },
-         { type: 'image_url', image_url: { url: image.dataUrl }, _name: image.name }]
+      ? imageTurnContent({ n: nextImageNumber(historyRef.current), name: image.name, dataUrl: image.dataUrl, text })
       : text;
     const full = [...historyRef.current, { role: 'user', content: userContent }];
     // Images in context are paid for again on every turn (the whole

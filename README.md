@@ -100,22 +100,44 @@ field as hex, so a data URL costs *twice* its length on the wire (6 MB photo
 — so two full-size photos in history would push every later message past
 the gateway's 32 MiB cap (413). Hence:
 
-- **Shrink before encrypting**: pictures are drawn on a canvas at ≤ 1568 px
-  on the long side and exported as JPEG 0.85 (vision models downsample to
-  that anyway; a phone photo becomes ~300–600 KB). Files ≤ 1 MB that already
-  fit are sent as-is, which keeps PNG transparency. Source cap 6 MB; result
-  cap 2 MB (more after resizing is abnormal → refused with a reason).
+- **Shrink before encrypting, to what the models actually look at**:
+  pictures are drawn on a canvas so that *both* the long side is ≤ 1568 px
+  *and* the area is ≤ 1.2 MP — the megapixel cap is the one that bites on a
+  normal photo (1568×1176 would be 1.84 MP and get downscaled again
+  server-side: Anthropic's standard tier keeps ~1.15 MP / 1568 image tokens,
+  Qwen3-VL recommends ~1.3 MP). A 4:3 phone photo lands at ~1264×948 and
+  ~300–500 KB. **PNG sources stay PNG** after the resize when the result fits
+  2 MB (screenshots and diagrams: JPEG artefacts are what makes small text
+  unreadable), falling back to JPEG 0.85 only if not; lossy sources go
+  straight to JPEG 0.85. Files already inside both caps are sent as-is (≤
+  1 MB for JPEG, ≤ 2 MB for PNG). Source cap 6 MB; result cap 2 MB (more
+  after resizing is abnormal → refused with a reason).
+- **Every image is numbered and introduced** by a text part —
+  `Image 2 (receipt.png):` — before the image, the question after it, the
+  way multi-image prompting guides recommend. The user can say "compare
+  image 1 and 2", and the placeholder below uses the same name.
 - **Context budget**: before each send the estimated encrypted size of the
   conversation is held under 8 MiB by replacing the *oldest* images with a
-  text placeholder (`[image sent earlier: name]`); the newest image always
-  stays so follow-up questions about it work. The user is told when an
-  image leaves the context, and the trimmed history is what gets kept.
+  text placeholder (`[Image 1 (receipt.png) sent earlier]`, the label part
+  is dropped with it); the newest image always stays so follow-up questions
+  about it work. The user is told when an image leaves the context, and the
+  trimmed history is what gets kept. Numbering keeps counting past retired
+  images.
 - **413 anyway** (an odd image, a huge text history): the app drops every
   image from context and retries once — the Edge has refunded that
   credit — and only then says "start a New chat".
 
-`npm test` pins all of this (budget, placeholders, resize decisions with a
-fake canvas).
+Why trim instead of the standard fix: chat providers avoid resending images
+with a **server-side file store** (upload once, reference a `file_id`). This
+gateway is a stateless E2EE relay — the picture exists in clear only inside
+the enclave while the request is served — so there is nothing to reference
+and every client must resend. An "encrypted file store inside the enclave"
+would be a gateway feature; until then trimming old images out of the
+resent history is the stateless equivalent of the "don't resend files"
+switch other chat UIs expose.
+
+`npm test` pins all of this (both caps, PNG-vs-JPEG choice with a fake
+canvas, labels and numbering, budget and placeholders).
 
 The end-to-end proof for this path (encrypted image through the Edge,
 decrypted only inside the enclave, correct description back) is

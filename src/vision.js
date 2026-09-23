@@ -8,23 +8,50 @@
 //   * Every turn resends the whole conversation, so an image in history is
 //     paid for again on every later message — forever, unless trimmed.
 //
-// Hence: shrink before encrypting (vision models downsample to ~1–2k px
-// anyway), and keep images in context only within a byte budget, oldest out
-// first, the latest always kept so follow-up questions about it still work.
+// Hence: shrink before encrypting (to what the models actually look at), and
+// keep images in context only within a byte budget, oldest out first, the
+// latest always kept so follow-up questions about it still work.
+//
+// The industry-standard fix for the second fact is a server-side file store
+// (upload once, resend a `file_id`). This gateway is a stateless E2EE relay —
+// the picture may exist in clear only inside the enclave while a request is
+// being served — so there is nothing to reference and the client must resend.
+// Trimming old images out of the resent history is the stateless equivalent
+// of "don't resend files" in other chat UIs.
 
+// Resize caps: BOTH must hold. The long-side cap is what vision APIs document;
+// the megapixel cap is what they actually keep — Anthropic's standard tier is
+// 1568 px on the long edge AND ~1.15 MP (1568 image tokens), Qwen3-VL's
+// recommended max_pixels is ~1.3 MP. A 1568×1176 photo (1.84 MP) would be
+// downscaled again server-side; fitting both caps up front saves ~30% of the
+// image tokens and the bytes we encrypt and resend.
 export const MAX_SIDE_PX = 1568;          // longest side after resize
+export const MAX_PIXELS = 1_200_000;      // width × height after resize
 export const JPEG_QUALITY = 0.85;
 export const MAX_SOURCE_BYTES = 6 * 1024 * 1024;   // what we accept from the picker (camera photos)
 export const MAX_ENCODED_BYTES = 2 * 1024 * 1024;  // what we accept AFTER resizing — more is abnormal
-export const KEEP_ORIGINAL_MAX_BYTES = 1024 * 1024; // small enough: send as-is (keeps PNG alpha)
+export const KEEP_ORIGINAL_MAX_BYTES = 1024 * 1024; // lossy source small enough: send as-is
 export const CONTEXT_BUDGET_BYTES = 8 * 1024 * 1024; // estimated ENCRYPTED size of all images in context
 
-/** Fit (w, h) inside a square of `maxSide`, never upscaling. */
-export function fitWithin(width, height, maxSide = MAX_SIDE_PX) {
+// Lossless sources (screenshots, diagrams, UI captures — anything with text)
+// stay lossless after the resize as long as they fit MAX_ENCODED_BYTES: JPEG
+// artefacts are exactly what makes small text unreadable to a vision model.
+// Only PNG: it is the one lossless type a canvas can export.
+const LOSSLESS_TYPES = new Set(['image/png']);
+
+/** Fit (w, h) under BOTH caps — long side ≤ maxSide and area ≤ maxPixels — keeping the ratio, never upscaling. */
+export function fitWithin(width, height, maxSide = MAX_SIDE_PX, maxPixels = MAX_PIXELS) {
+  let k = 1;
   const longest = Math.max(width, height);
-  if (longest <= maxSide) return [width, height];
-  const k = maxSide / longest;
-  return [Math.max(1, Math.round(width * k)), Math.max(1, Math.round(height * k))];
+  if (longest > maxSide) k = maxSide / longest;
+  const area = width * height * k * k;
+  if (area > maxPixels) k *= Math.sqrt(maxPixels / area);
+  if (k >= 1) return [width, height];
+  let w = Math.max(1, Math.round(width * k)), h = Math.max(1, Math.round(height * k));
+  if (w * h > maxPixels || Math.max(w, h) > maxSide) {   // rounding pushed it over: round down instead
+    w = Math.max(1, Math.floor(width * k)); h = Math.max(1, Math.floor(height * k));
+  }
+  return [w, h];
 }
 
 /** Decoded byte size of a data: URL's payload (base64 → bytes). */
@@ -61,36 +88,90 @@ export const browserImageEnv = {
 
 /**
  * Turn a picked File into the attachment the app sends.
- * Small images (≤ KEEP_ORIGINAL_MAX_BYTES and ≤ MAX_SIDE_PX) go as-is — that
- * keeps PNG transparency and avoids a needless re-encode. Everything else is
- * drawn onto a canvas at most MAX_SIDE_PX on the long side and exported as
- * JPEG. The result must fit MAX_ENCODED_BYTES or the picture is refused.
  *
- * @returns {Promise<{name, dataUrl, bytes, width, height, resized, originalBytes}>}
+ *  - Already within both pixel caps and small enough → sent as-is, no
+ *    re-encode ("small enough" is KEEP_ORIGINAL_MAX_BYTES for lossy sources,
+ *    MAX_ENCODED_BYTES for PNG — re-encoding a PNG at the same size gains
+ *    nothing and would only cost its text legibility).
+ *  - Otherwise drawn on a canvas at the fitted size. A PNG source is exported
+ *    as PNG first and falls back to JPEG only if that is still over
+ *    MAX_ENCODED_BYTES; a lossy source goes straight to JPEG `quality`.
+ *  - The result must fit MAX_ENCODED_BYTES or the picture is refused.
+ *
+ * @returns {Promise<{name, dataUrl, mime, bytes, width, height, resized, originalBytes}>}
  */
 export async function prepareImage(file, {
-  maxSide = MAX_SIDE_PX, quality = JPEG_QUALITY,
+  maxSide = MAX_SIDE_PX, maxPixels = MAX_PIXELS, quality = JPEG_QUALITY,
   keepOriginalMaxBytes = KEEP_ORIGINAL_MAX_BYTES, maxEncodedBytes = MAX_ENCODED_BYTES,
 } = {}, env = browserImageEnv) {
   const img = await env.decode(file);
   try {
-    const small = file.size <= keepOriginalMaxBytes && Math.max(img.width, img.height) <= maxSide;
-    let dataUrl, width = img.width, height = img.height, resized = false;
-    if (small) {
+    const [width, height] = fitWithin(img.width, img.height, maxSide, maxPixels);
+    const needsResize = width !== img.width || height !== img.height;
+    const lossless = LOSSLESS_TYPES.has(file.type);
+    const asIsCap = lossless ? maxEncodedBytes : keepOriginalMaxBytes;
+    let dataUrl, mime, resized = false;
+    if (!needsResize && file.size <= asIsCap) {
       dataUrl = await env.readDataUrl(file);
+      mime = file.type;
     } else {
-      [width, height] = fitWithin(img.width, img.height, maxSide);
-      dataUrl = env.encode(img.source, width, height, 'image/jpeg', quality);
       resized = true;
+      if (lossless && needsResize) {           // same-size PNG re-encode can't shrink: skip straight to JPEG
+        dataUrl = env.encode(img.source, width, height, 'image/png');
+        mime = 'image/png';
+      }
+      if (!dataUrl || dataUrlBytes(dataUrl) > maxEncodedBytes) {
+        dataUrl = env.encode(img.source, width, height, 'image/jpeg', quality);
+        mime = 'image/jpeg';
+      }
     }
     const bytes = dataUrlBytes(dataUrl);
     if (bytes > maxEncodedBytes) {
       throw new Error(`image is still ${(bytes / 1e6).toFixed(1)} MB after resizing — limit ${(maxEncodedBytes / 1e6).toFixed(0)} MB`);
     }
-    return { name: file.name, dataUrl, bytes, width, height, resized, originalBytes: file.size };
+    return { name: file.name, dataUrl, mime, bytes, width, height, resized, originalBytes: file.size };
   } finally {
     img.close?.();
   }
+}
+
+// ─── labelling ───────────────────────────────────────────────────────────
+//
+// Every image is numbered across the conversation and introduced by a short
+// text part — `Image 3 (receipt.png):` — the way multi-image prompting guides
+// recommend, so the user, the model and the placeholder that later replaces a
+// trimmed image all call it by one name. App-only bookkeeping rides on the
+// parts as `_`-prefixed fields (`_n`, `_name`, `_labelFor`, `_placeholderFor`)
+// which `toWire` strips before anything is sent.
+
+/** `Image N (name)` — the one name an image goes by in labels and placeholders. */
+export function imageLabel(n, name) {
+  return `Image ${n} (${name ?? 'image'})`;
+}
+
+/** 1 + the highest image number already used in `messages` (images AND placeholders count). */
+export function nextImageNumber(messages) {
+  let max = 0;
+  for (const m of messages) {
+    if (!Array.isArray(m?.content)) continue;
+    for (const p of m.content) {
+      const n = p?._n ?? p?._placeholderFor ?? p?._labelFor;
+      if (Number.isInteger(n) && n > max) max = n;
+    }
+  }
+  return max + 1;
+}
+
+/**
+ * The content parts of a user turn that carries an image:
+ * label → image → the user's question (or a default one).
+ */
+export function imageTurnContent({ n, name, dataUrl, text }) {
+  return [
+    { type: 'text', text: `${imageLabel(n, name)}:`, _labelFor: n },
+    { type: 'image_url', image_url: { url: dataUrl }, _name: name, _n: n },
+    { type: 'text', text: text || 'Describe this image.' },
+  ];
 }
 
 // ─── context budget ──────────────────────────────────────────────────────
@@ -115,22 +196,35 @@ export function estimateEncryptedBytes(messages) {
   return total;
 }
 
-const placeholderFor = (part) => ({ type: 'text', text: `[image sent earlier: ${part._name ?? 'image'}]` });
+/** How an image part is referred to once it is gone: `Image 2 (b.jpg)`, or `image b.jpg` for an unnumbered part. */
+const describe = (part) => (Number.isInteger(part._n) ? imageLabel(part._n, part._name) : `image ${part._name ?? ''}`.trim());
 
-/** Every image part in `messages`, oldest first, as {mi, ci, name}. */
+const placeholderFor = (part) => ({
+  type: 'text', text: `[${describe(part)} sent earlier]`,
+  ...(Number.isInteger(part._n) ? { _placeholderFor: part._n } : {}),
+});
+
+/** Every image part in `messages`, oldest first, as {mi, ci, label}. */
 function imageParts(messages) {
   const out = [];
   messages.forEach((m, mi) => {
     if (!Array.isArray(m?.content)) return;
-    m.content.forEach((p, ci) => { if (p?.type === 'image_url') out.push({ mi, ci, name: p._name ?? 'image' }); });
+    m.content.forEach((p, ci) => { if (p?.type === 'image_url') out.push({ mi, ci, label: describe(p) }); });
   });
   return out;
 }
 
-function replacePart(messages, mi, ci, replacement) {
+/**
+ * Replace the image part at (mi, ci) with its placeholder and drop the label
+ * part that introduced it (the placeholder carries the same name, so keeping
+ * "Image 2 (b.jpg):" in front of "[Image 2 (b.jpg) sent earlier]" is noise).
+ */
+function retireImage(messages, mi, ci) {
   const copy = messages.slice();
-  const content = copy[mi].content.slice();
-  content[ci] = replacement;
+  const part = copy[mi].content[ci];
+  const content = copy[mi].content
+    .map((p, i) => (i === ci ? placeholderFor(part) : p))
+    .filter((p) => !(Number.isInteger(part._n) && p?._labelFor === part._n));
   copy[mi] = { ...copy[mi], content };
   return copy;
 }
@@ -141,7 +235,7 @@ function replacePart(messages, mi, ci, replacement) {
  * The newest image is never dropped: the user may be asking about it.
  * Pure — returns new arrays; the caller decides whether to persist them.
  *
- * @returns {{ messages: object[], dropped: string[] }}
+ * @returns {{ messages: object[], dropped: string[] }}  dropped = labels, oldest first
  */
 export function trimImageContext(messages, { budgetBytes = CONTEXT_BUDGET_BYTES } = {}) {
   let current = messages;
@@ -149,9 +243,8 @@ export function trimImageContext(messages, { budgetBytes = CONTEXT_BUDGET_BYTES 
   let images = imageParts(current);
   while (images.length > 1 && estimateEncryptedBytes(current) > budgetBytes) {
     const oldest = images[0];
-    const part = current[oldest.mi].content[oldest.ci];
-    current = replacePart(current, oldest.mi, oldest.ci, placeholderFor(part));
-    dropped.push(oldest.name);
+    current = retireImage(current, oldest.mi, oldest.ci);
+    dropped.push(oldest.label);
     images = imageParts(current);
   }
   return { messages: current, dropped };
@@ -161,10 +254,10 @@ export function trimImageContext(messages, { budgetBytes = CONTEXT_BUDGET_BYTES 
 export function stripAllImages(messages) {
   let current = messages;
   const dropped = [];
-  for (const img of imageParts(messages).reverse()) {   // indexes stay valid: parts are replaced 1:1
-    const part = current[img.mi].content[img.ci];
-    current = replacePart(current, img.mi, img.ci, placeholderFor(part));
-    dropped.unshift(img.name);
+  for (let images = imageParts(current); images.length; images = imageParts(current)) {
+    const oldest = images[0];
+    current = retireImage(current, oldest.mi, oldest.ci);
+    dropped.push(oldest.label);
   }
   return { messages: current, dropped };
 }
