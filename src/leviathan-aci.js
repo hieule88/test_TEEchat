@@ -57,12 +57,44 @@ const DEFAULTS = Object.freeze({
 });
 
 // ─── Small helpers ────────────────────────────────────────────────────────────
-const hex = b => [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('');
-const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));
-const utf8 = s => new TextEncoder().encode(s);
+// hex/unhex run over whole E2EE ciphertexts — megabytes for an image, on the
+// main thread, every turn. Like @noble/hashes: the ES2027 built-ins
+// (Uint8Array#toHex / Uint8Array.fromHex, Baseline since 2025) when the
+// browser has them, else a table lookup into a byte buffer + one
+// TextDecoder/TextEncoder pass — ~13 ms for a 2.7 MB image data URL, where
+// spread/map/join took ~330 ms (~0.8 s for a 6 MB one; AES itself is ~17 ms).
+const HAS_HEX_BUILTIN = typeof Uint8Array.prototype.toHex === 'function' && typeof Uint8Array.fromHex === 'function';
+const HEX_HI = new Uint8Array(256), HEX_LO = new Uint8Array(256);
+for (let i = 0; i < 256; i++) { const s = i.toString(16).padStart(2, '0'); HEX_HI[i] = s.charCodeAt(0); HEX_LO[i] = s.charCodeAt(1); }
+const HEX_NIBBLE = new Int8Array(128).fill(-1);
+for (let i = 0; i < 16; i++) { HEX_NIBBLE['0123456789abcdef'.charCodeAt(i)] = i; HEX_NIBBLE['0123456789ABCDEF'.charCodeAt(i)] = i; }
+const asciiDecoder = new TextDecoder(), utf8Encoder = new TextEncoder();
+const hex = (b) => {
+  const u = new Uint8Array(b);
+  if (HAS_HEX_BUILTIN) return u.toHex();
+  const out = new Uint8Array(u.length * 2);
+  for (let i = 0, j = 0; i < u.length; i++) { out[j++] = HEX_HI[u[i]]; out[j++] = HEX_LO[u[i]]; }
+  return asciiDecoder.decode(out);
+};
+/** Strict (as the built-in and @noble are): throws on odd length or a non-hex character instead of yielding zero bytes. */
+const unhex = (s) => {
+  if (s.startsWith('0x')) s = s.slice(2);
+  if (HAS_HEX_BUILTIN) return Uint8Array.fromHex(s);
+  if (s.length % 2) throw new Error('unhex: odd length');
+  const a = utf8Encoder.encode(s);
+  if (a.length !== s.length) throw new Error('unhex: non-ASCII input');
+  const out = new Uint8Array(a.length >>> 1);
+  for (let i = 0, j = 0; j < out.length; j++) {
+    const hi = HEX_NIBBLE[a[i++] & 127], lo = HEX_NIBBLE[a[i++] & 127];
+    if (hi < 0 || lo < 0) throw new Error('unhex: non-hex character');
+    out[j] = (hi << 4) | lo;
+  }
+  return out;
+};
+const b64 = b => btoa(String.fromCharCode(...new Uint8Array(b)));   // signatures only (≤ 64 bytes)
+const utf8 = s => utf8Encoder.encode(s);
 const sha256 = async b => hex(await crypto.subtle.digest('SHA-256', b));
 const randPriv = c => (c.utils.randomSecretKey ?? c.utils.randomPrivateKey)();
-const unhex = s => Uint8Array.from((s.replace(/^0x/, '').match(/.{2}/g) ?? []).map(h => parseInt(h, 16)));
 
 // ─── E2EE v2 (ACI §7, X25519 suite) ───────────────────────────────────────────
 // Every primitive is Web Crypto except the curve, which comes from the same

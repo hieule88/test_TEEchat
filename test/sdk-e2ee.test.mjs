@@ -134,6 +134,30 @@ test('chat() encrypts text AND image parts per field path; the Edge sees no plai
   assert.equal(out.raw.choices[0].message.content, REPLY, 'raw is decrypted in place');
 });
 
+test('a real-size image (2 MB → 2.7 MB data URL) round-trips byte-exact, and hex is not the bottleneck', async () => {
+  // The hex step used to be spread/map/join: ~330 ms for this size on V8
+  // (~0.8 s for a 6 MB image) on the main thread, every turn. This pins
+  // correctness at scale; the loose time bound only catches a regression to
+  // that order of magnitude, not CI jitter.
+  const bytes = randomBytes(2 * 1024 * 1024);
+  const image = 'data:image/jpeg;base64,' + bytes.toString('base64');
+  const edge = makeFakeEdge();
+  const aci = sdkWithSession(edge.fetch);
+  const t0 = performance.now();
+  const out = await aci.chat({ model: 'glm-5.3-flash', messages: [{ role: 'user', content: [
+    { type: 'text', text: 'Image 1 (big.jpg):' },
+    { type: 'image_url', image_url: { url: image } },
+    { type: 'text', text: PROMPT },
+  ] }] });
+  const ms = performance.now() - t0;
+  const got = edge.seen.decrypted.find((d) => d.field === 'messages.0.content.1.image_url.url');
+  assert.equal(got.text.length, image.length);
+  assert.equal(got.text, image, 'every byte of the image survives encrypt → hex → unhex → decrypt');
+  assert.ok(!edge.seen.rawBody.includes(image.slice(30, 90)), 'no plaintext image bytes on the wire');
+  assert.equal(out.content, REPLY);
+  assert.ok(ms < 1500, `whole encrypted turn took ${ms.toFixed(0)} ms`);
+});
+
 test('a part type the gateway cannot decrypt in place falls back to whole-content encryption', async () => {
   const edge = makeFakeEdge();
   const aci = sdkWithSession(edge.fetch);
