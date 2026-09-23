@@ -92,7 +92,11 @@ is a separate ciphertext** bound to its field path
 (`messages.{m}.content.{c}.image_url.url`). Switching to a text-only model
 drops a staged image with a notice. Both vision models reason before
 answering, so the app never sets a small `max_tokens` — with one, `content`
-comes back `null` and only `reasoningContent` is filled.
+comes back `null` and only `reasoningContent` is filled. The 🔍 web-search
+toggle stays available with an image attached: verified on production that
+one request can carry an encrypted image *and* `web_search: true` — both
+models described the picture and answered from the web, and the
+`web_searches` disclosure is shown under the reply as usual.
 
 **Size discipline (`src/vision.js`).** Two facts compound: E2EE writes every
 field as hex, so a data URL costs *twice* its length on the wire (6 MB photo
