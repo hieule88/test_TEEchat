@@ -90,7 +90,10 @@ the upstream fetch it from a host that then knows what you asked — sent as
 an OpenAI content-parts message, and **each part (the text and the image)
 is a separate ciphertext** bound to its field path
 (`messages.{m}.content.{c}.image_url.url`). Switching to a text-only model
-drops a staged image with a notice. Both vision models reason before
+drops a staged image with a notice, and images already in the history are
+withheld from that model (placeholders in their place, kept history
+untouched, one warning per switch) — switch back to a 👁 model and they are
+sent again. Both vision models reason before
 answering, so the app never sets a small `max_tokens` — with one, `content`
 comes back `null` and only `reasoningContent` is filled. The 🔍 web-search
 toggle stays available with an image attached: verified on production that

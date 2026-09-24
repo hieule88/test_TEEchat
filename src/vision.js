@@ -263,6 +263,20 @@ export function stripAllImages(messages) {
 }
 
 /**
+ * What actually goes on the wire for the CURRENT model. A model without
+ * "image" in its `input_modalities` gets every image replaced by its
+ * placeholder — for this request only. The caller keeps the un-stripped
+ * history, so switching back to a vision model brings the pictures back.
+ * (Never send images a model is not declared to take: the failure is an
+ * upstream 4xx on every later turn, not a graceful ignore.)
+ *
+ * @returns {{ messages: object[], dropped: string[] }}
+ */
+export function outgoingFor(messages, { imagesAllowed }) {
+  return imagesAllowed ? { messages, dropped: [] } : stripAllImages(messages);
+}
+
+/**
  * The messages as the API must see them: app-only fields (leading `_`, such
  * as `_name` on image parts) removed at every level. Upstreams may reject
  * unknown keys in content parts.

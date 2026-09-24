@@ -3,7 +3,8 @@ import { test } from 'node:test';
 
 import {
   CONTEXT_BUDGET_BYTES, MAX_ENCODED_BYTES, MAX_PIXELS, MAX_SIDE_PX, dataUrlBytes, estimateEncryptedBytes,
-  fitWithin, imageLabel, imageTurnContent, nextImageNumber, prepareImage, stripAllImages, toWire, trimImageContext,
+  fitWithin, imageLabel, imageTurnContent, nextImageNumber, outgoingFor, prepareImage, stripAllImages, toWire,
+  trimImageContext,
 } from '../src/vision.js';
 
 const MB = 1024 * 1024;
@@ -128,6 +129,24 @@ test('stripAllImages replaces every image, newest included, preserving positions
     assert.equal(messages[i].content[0]._placeholderFor, n);
     assert.equal(messages[i].content[1].text, 'look');        // the question part is still there
   }
+});
+
+test('outgoingFor strips every image for a text-only model and leaves the input (the kept history) intact', () => {
+  const history = [imgTurn(1, 'a.jpg', MB), reply('r'), imgTurn(2, 'b.jpg', MB)];
+  const { messages, dropped } = outgoingFor(history, { imagesAllowed: false });
+  assert.deepEqual(dropped, ['Image 1 (a.jpg)', 'Image 2 (b.jpg)']);
+  assert.ok(!JSON.stringify(messages).includes('image_url'));
+  assert.equal(messages[0].content[0].text, '[Image 1 (a.jpg) sent earlier]');
+  // history untouched → switching back to a vision model restores the pictures
+  assert.equal(history[0].content[1].type, 'image_url');
+  assert.equal(history[2].content[1].type, 'image_url');
+});
+
+test('outgoingFor is a no-op for a vision model', () => {
+  const history = [imgTurn(1, 'a.jpg', MB), reply()];
+  const out = outgoingFor(history, { imagesAllowed: true });
+  assert.equal(out.messages, history);
+  assert.deepEqual(out.dropped, []);
 });
 
 test('toWire strips app-only underscore fields at every level and nothing else', () => {

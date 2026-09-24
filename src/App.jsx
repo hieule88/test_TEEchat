@@ -1,7 +1,8 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { aci, AciError, MAX_SPEND } from './aci';
 import {
-  MAX_SOURCE_BYTES, imageTurnContent, nextImageNumber, prepareImage, stripAllImages, toWire, trimImageContext,
+  MAX_SOURCE_BYTES, imageTurnContent, nextImageNumber, outgoingFor, prepareImage, stripAllImages, toWire,
+  trimImageContext,
 } from './vision';
 
 // React escapes all interpolated text ({value}) by default, so server-provided
@@ -55,6 +56,9 @@ export default function App() {
   // writes hex, so every byte costs two on the wire.
   const [attachment, setAttachment] = useState(null);
   const fileRef = useRef(null);
+  // The text-only model we last warned about (images in history withheld
+  // from it) — so the notice shows once per switch, not on every turn.
+  const textOnlyNoticeRef = useRef(null);
   const [messages, setMessages] = useState([
     { role: 'ai', text: '👋 Connect your Leviathan wallet, open a session, then chat. Every message is signed by your wallet — no API key.' },
   ]);
@@ -195,6 +199,23 @@ export default function App() {
     if (dropped.length) {
       notify('warn', `Older image${dropped.length > 1 ? 's' : ''} left the conversation context to keep it sendable: ${dropped.join(', ')}.`);
     }
+    // `outgoing` is what we KEEP. What we SEND may have less: a model whose
+    // input_modalities lack "image" (the user switched mid-conversation) gets
+    // every image replaced by its placeholder for this request only — sending
+    // them would fail on every turn until New chat — while the kept history
+    // still has them, so switching back to a vision model restores them.
+    let toSend = outgoing;
+    if (canAttach) {
+      textOnlyNoticeRef.current = null;
+    } else {
+      const withheld = outgoingFor(outgoing, { imagesAllowed: false });
+      toSend = withheld.messages;
+      if (withheld.dropped.length && textOnlyNoticeRef.current !== model) {
+        textOnlyNoticeRef.current = model;
+        notify('warn', `${model} does not take images — ${withheld.dropped.length} image${withheld.dropped.length > 1 ? 's' : ''} in this conversation `
+          + `replaced by a placeholder for it (${withheld.dropped.join(', ')}). Pick a model marked 👁 to ask about them again.`);
+      }
+    }
     try {
       // Only include the flag when on: an older gateway would forward an
       // unknown top-level field to the upstream, which may reject it.
@@ -203,17 +224,18 @@ export default function App() {
       });
       let result;
       try {
-        result = await send(outgoing);
+        result = await send(toSend);
       } catch (err) {
         // 413: the body still exceeded the gateway's cap (an outsized image,
         // or a very long text history). The Edge refunded that credit. Drop
-        // every image from context and try once more before giving up.
+        // every image from context — kept history included, this is
+        // permanent — and try once more before giving up.
         const isTooLarge = err instanceof AciError && err.status === 413;
-        const stripped = isTooLarge ? stripAllImages(outgoing) : null;
+        const stripped = isTooLarge ? stripAllImages(toSend) : null;
         if (!stripped || !stripped.dropped.length) throw err;
         notify('warn', `The request was too large — retrying without the ${stripped.dropped.length} image${stripped.dropped.length > 1 ? 's' : ''} in context.`);
-        outgoing = stripped.messages;
-        result = await send(outgoing);
+        outgoing = toSend = stripped.messages;
+        result = await send(toSend);
       }
       const { content, receiptId, raw } = result;
       // Egress disclosure from the gateway: every query the model sent out of
@@ -249,7 +271,7 @@ export default function App() {
     } finally {
       setBusy(false);
     }
-  }, [prompt, attachment, model, webSearch, sync]);
+  }, [prompt, attachment, model, canAttach, webSearch, sync]);
 
   const onRefresh = useCallback(async () => {
     try { await aci.refreshBalance(); sync(); notify('ok', 'Balance refreshed'); }
