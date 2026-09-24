@@ -35,6 +35,9 @@ function explain(e) {
       // the gateway refuses bodies over 32 MB. The credit for a 413 is refunded.
       // Reached only after the automatic retry without images also failed.
       http_413: 'This conversation is too large to send even without images — start a New chat (the credit was refunded).',
+      // Same situation, refused by the Edge itself (by Content-Length, before
+      // any debit — so nothing to refund) instead of by the gateway.
+      request_too_large: 'This conversation is too large to send even without images — start a New chat (nothing was charged).',
     };
     return hints[e.type] || `${e.message} (${e.type})`;
   }
