@@ -130,9 +130,14 @@ the gateway's 32 MiB cap (413). Hence:
   about it work. The user is told when an image leaves the context, and the
   trimmed history is what gets kept. Numbering keeps counting past retired
   images.
-- **413 anyway** (an odd image, a huge text history): the app drops every
-  image from context and retries once — the Edge has refunded that
-  credit — and only then says "start a New chat".
+- **413 anyway** (an odd image, a huge text history): the app drops the
+  *older* images from context and retries once — the Edge has refunded
+  that credit. The image of the turn being sent is never dropped: a
+  placeholder saying "sent earlier" for a picture the model never got would
+  make it answer about nothing. If there is no older image to drop, there is
+  no retry — the image goes back to the attach box and the message says so;
+  a text-only conversation that is still too large is told to start a New
+  chat.
 
 Why trim instead of the standard fix: chat providers avoid resending images
 with a **server-side file store** (upload once, reference a `file_id`). This

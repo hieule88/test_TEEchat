@@ -3,8 +3,8 @@ import { test } from 'node:test';
 
 import {
   CONTEXT_BUDGET_BYTES, MAX_ENCODED_BYTES, MAX_PIXELS, MAX_SIDE_PX, dataUrlBytes, estimateEncryptedBytes,
-  fitWithin, imageLabel, imageTurnContent, nextImageNumber, outgoingFor, prepareImage, stripAllImages, toWire,
-  trimImageContext,
+  fitWithin, imageLabel, imageTurnContent, nextImageNumber, outgoingFor, prepareImage, stripAllImages,
+  stripHistoryImages, toWire, trimImageContext,
 } from '../src/vision.js';
 
 const MB = 1024 * 1024;
@@ -129,6 +129,31 @@ test('stripAllImages replaces every image, newest included, preserving positions
     assert.equal(messages[i].content[0]._placeholderFor, n);
     assert.equal(messages[i].content[1].text, 'look');        // the question part is still there
   }
+});
+
+test('stripHistoryImages (413 retry) keeps the current turn\'s image and retires only older ones', () => {
+  const msgs = [imgTurn(1, 'a.jpg', MB), reply(), imgTurn(2, 'b.jpg', MB), reply(), imgTurn(3, 'now.jpg', MB)];
+  const { messages, dropped } = stripHistoryImages(msgs);
+  assert.deepEqual(dropped, ['Image 1 (a.jpg)', 'Image 2 (b.jpg)']);
+  assert.equal(messages[0].content[0].text, '[Image 1 (a.jpg) sent earlier]');
+  assert.equal(messages[4], msgs[4], 'the turn being sent is untouched — the model really gets that picture');
+  assert.equal(messages[4].content[1].type, 'image_url');
+});
+
+test('stripHistoryImages refuses to help when only the current turn has an image (caller must not retry)', () => {
+  const only = [{ role: 'user', content: 'hi' }, reply(), imgTurn(1, 'now.jpg', 6 * MB)];
+  const out = stripHistoryImages(only);
+  assert.deepEqual(out.dropped, []);
+  assert.equal(out.messages, only);
+  assert.deepEqual(stripHistoryImages([imgTurn(1, 'x', MB)]), { messages: [imgTurn(1, 'x', MB)], dropped: [] });
+});
+
+test('stripHistoryImages strips all history images when the current turn is text-only', () => {
+  const msgs = [imgTurn(1, 'a.jpg', MB), reply(), imgTurn(2, 'b.jpg', MB), reply(), { role: 'user', content: 'and now?' }];
+  const { messages, dropped } = stripHistoryImages(msgs);
+  assert.deepEqual(dropped, ['Image 1 (a.jpg)', 'Image 2 (b.jpg)']);
+  assert.ok(!JSON.stringify(messages).includes('image_url'));
+  assert.equal(messages[4].content, 'and now?');
 });
 
 test('outgoingFor strips every image for a text-only model and leaves the input (the kept history) intact', () => {

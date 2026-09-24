@@ -263,6 +263,23 @@ export function stripAllImages(messages) {
 }
 
 /**
+ * Replace every image part EXCEPT those in the last message (the turn being
+ * sent now) with its placeholder — the 413 retry. Only pictures the model
+ * has actually seen before may be called "sent earlier"; stripping the
+ * current turn's image would make the model answer about a picture it never
+ * got. If nothing older exists, `dropped` is empty and `messages` is
+ * returned as-is: the caller must NOT retry (the current image or the text
+ * is the cause) and should give the image back to the user.
+ */
+export function stripHistoryImages(messages) {
+  if (messages.length < 2) return { messages, dropped: [] };
+  const history = messages.slice(0, -1);
+  const { messages: stripped, dropped } = stripAllImages(history);
+  if (!dropped.length) return { messages, dropped };
+  return { messages: [...stripped, messages[messages.length - 1]], dropped };
+}
+
+/**
  * What actually goes on the wire for the CURRENT model. A model without
  * "image" in its `input_modalities` gets every image replaced by its
  * placeholder — for this request only. The caller keeps the un-stripped

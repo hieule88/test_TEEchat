@@ -1,7 +1,7 @@
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import { aci, AciError, MAX_SPEND } from './aci';
 import {
-  MAX_SOURCE_BYTES, imageTurnContent, nextImageNumber, outgoingFor, prepareImage, stripAllImages, toWire,
+  MAX_SOURCE_BYTES, imageTurnContent, nextImageNumber, outgoingFor, prepareImage, stripHistoryImages, toWire,
   trimImageContext,
 } from './vision';
 
@@ -226,12 +226,14 @@ export default function App() {
       try {
         result = await send(toSend);
       } catch (err) {
-        // 413: the body still exceeded the gateway's cap (an outsized image,
-        // or a very long text history). The Edge refunded that credit. Drop
-        // every image from context — kept history included, this is
-        // permanent — and try once more before giving up.
+        // 413: the body still exceeded the gateway's cap. The Edge refunded
+        // that credit. Drop the OLDER images (history only — the turn being
+        // sent keeps its picture, or the model would answer about an image
+        // it never received) and try once more. Nothing older to drop means
+        // this turn's image or the text is the cause: no retry, the outer
+        // catch gives the image back.
         const isTooLarge = err instanceof AciError && err.status === 413;
-        const stripped = isTooLarge ? stripAllImages(toSend) : null;
+        const stripped = isTooLarge ? stripHistoryImages(toSend) : null;
         if (!stripped || !stripped.dropped.length) throw err;
         notify('warn', `The request was too large — retrying without the ${stripped.dropped.length} image${stripped.dropped.length > 1 ? 's' : ''} in context.`);
         outgoing = toSend = stripped.messages;
@@ -263,9 +265,16 @@ export default function App() {
       aci.refreshBalance().then(sync).catch(() => {});
     } catch (err) {
       if (image) setAttachment(image);   // a failed turn is dropped; give the image back
+      // 413 with an image in THIS turn: older images (if any) were already
+      // dropped, so the picture itself is what does not fit — say that
+      // instead of the generic "start a New chat".
+      const tooLargeWithImage = image && err instanceof AciError && err.status === 413;
+      const why = tooLargeWithImage
+        ? 'The request is too large with this image even after older images were dropped — it is back in the attach box; try it in a New chat or attach a smaller one (the credit was refunded).'
+        : explain(err);
       setMessages((m) => {
         const copy = [...m];
-        copy[copy.length - 1] = { role: 'ai', text: `⚠ ${explain(err)}`, error: true };
+        copy[copy.length - 1] = { role: 'ai', text: `⚠ ${why}`, error: true };
         return copy;
       });
     } finally {
