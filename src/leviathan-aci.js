@@ -12,6 +12,7 @@
  *   openSession()    → one Falcon signature (wallet popup) opens a session
  *   chat()/models()  → normal calls, each silently Ed25519-signed
  *   getReceipt()     → fetch the TEE-signed receipt of a call
+ *   verifyReceipt()  → check its signature + that the enclave decrypted exactly our body
  *   createTopup()    → payment intent; 'onchain' returns wallet pay instructions
  *   payTopup()       → pay an 'onchain' intent from the wallet (one popup)
  *   waitForTopup()   → poll until the ledger credits the intent
@@ -326,7 +327,8 @@ export class LeviathanACI {
    * up front (a typed, self-explanatory error) instead of letting res.json()
    * die on the SSE bytes. If you need streaming, call signedFetch() yourself
    * and parse the `data:` chunks.
-   * @returns {Promise<{content: string, receiptId: string|null, raw: object}>}
+   * @returns {Promise<{content: string, reasoningContent: string|null, receiptId: string|null, bodyHash: string, raw: object, e2ee: boolean}>}
+   *   `bodyHash` is what the receipt must commit to — hand it to verifyReceipt().
    */
   async chat({ model, messages, stream, e2ee = true, ...rest }) {
     if (stream) {
@@ -335,16 +337,22 @@ export class LeviathanACI {
     }
     if (typeof model !== 'string' || !model) throw new AciError('config', 'model is required');
 
+    // What the receipt will commit to (ACI §9): the request body as the
+    // enclave sees it AFTER decryption — the plaintext object, compact, in
+    // this key order. Same bytes whether E2EE is on or off, so a receipt can
+    // be checked against it either way (verifyReceipt).
+    const plainBody = JSON.stringify({ model, messages, ...rest });
+    const bodyHash = 'sha256:' + await sha256(utf8(plainBody));
+
     if (!e2ee) {
-      const res = await this.signedFetch('/v1/chat/completions',
-        { body: JSON.stringify({ model, messages, ...rest }) });
+      const res = await this.signedFetch('/v1/chat/completions', { body: plainBody });
       if (!res.ok) throw await toError(res);
       const raw = await res.json();
       return {
         content: raw.choices?.[0]?.message?.content ?? null,
         reasoningContent: raw.choices?.[0]?.message?.reasoning_content ?? null,
         receiptId: res.headers.get('x-receipt-id'),
-        raw, e2ee: false,
+        bodyHash, raw, e2ee: false,
       };
     }
 
@@ -419,7 +427,7 @@ export class LeviathanACI {
       content: raw.choices?.[0]?.message?.content ?? null,
       reasoningContent: raw.choices?.[0]?.message?.reasoning_content ?? null,
       receiptId: res.headers.get('x-receipt-id'),
-      raw, e2ee: true,
+      bodyHash, raw, e2ee: true,
     };
   }
 
@@ -430,20 +438,27 @@ export class LeviathanACI {
    * double every round trip.
    */
   async _e2eeServiceKey() {
-    const c = this._e2eeKeyCache;
-    if (c && Date.now() - c.at < 10 * 60_000) return c.key;
-    const nonce = hex(crypto.getRandomValues(new Uint8Array(32)));
-    const res = await this._fetch(`${this.serviceOrigin}/v1/attestation/report?nonce=${nonce}`);
-    if (!res.ok) throw await toError(res);
-    const report = await res.json();
-    const entry = (report?.attestation?.workload_keyset?.e2ee_public_keys ?? [])
+    const keyset = await this._attestedKeyset();
+    const entry = (keyset.e2ee_public_keys ?? [])
       .find((k) => k?.algo === E2EE_SUITE && typeof k.public_key === 'string');
     if (!entry) {
       throw new AciError('e2ee_no_key',
         `the attestation report carries no ${E2EE_SUITE} E2EE key`);
     }
-    this._e2eeKeyCache = { key: entry.public_key.replace(/^0x/, ''), at: Date.now() };
-    return this._e2eeKeyCache.key;
+    return entry.public_key.replace(/^0x/, '');
+  }
+
+  /** The attestation report's workload keyset (E2EE keys + receipt-signing keys), cached 10 min. */
+  async _attestedKeyset() {
+    const c = this._keysetCache;
+    if (c && Date.now() - c.at < 10 * 60_000) return c.keyset;
+    const nonce = hex(crypto.getRandomValues(new Uint8Array(32)));
+    const res = await this._fetch(`${this.serviceOrigin}/v1/attestation/report?nonce=${nonce}`);
+    if (!res.ok) throw await toError(res);
+    const report = await res.json();
+    const keyset = report?.attestation?.workload_keyset ?? {};
+    this._keysetCache = { keyset, at: Date.now() };
+    return keyset;
   }
 
   /**
@@ -728,6 +743,50 @@ export class LeviathanACI {
     const res = await this.signedFetch(`/v1/aci/receipts/${receiptId}`, { method: 'GET' });
     if (!res.ok) throw await toError(res);
     return await res.json();
+  }
+
+  /**
+   * Verify a receipt instead of taking it on faith (ACI §9). Fetches it and
+   * checks, in order:
+   *   signed_by_attested_key — Ed25519 over the JCS form of the receipt (with
+   *                            `signature.value` removed), by a key listed in
+   *                            the attestation report's receipt_signing_keys;
+   *   body_hash_matches      — `event_log[request.received].body_hash` equals
+   *                            the `bodyHash` chat() returned. The receipt
+   *                            commits to the body AFTER the enclave decrypted
+   *                            it, so a match says it decrypted exactly the
+   *                            request we meant — text and images alike;
+   *   model_matches / receipt_id_matches — when given / always.
+   * A check you did not supply the input for is `null`, never a pass.
+   * Resolves `{ ok: true, checks, receipt }`; throws AciError('receipt_invalid')
+   * carrying `.checks` when any check is false.
+   */
+  async verifyReceipt(receiptId, { bodyHash = null, model = null } = {}) {
+    const receipt = await this.getReceipt(receiptId);
+    const sig = receipt?.signature ?? {};
+    const keys = (await this._attestedKeyset()).receipt_signing_keys ?? [];
+    const signing = keys.find((k) => k?.key_id === sig.key_id && k?.algo === 'ed25519'
+      && typeof k.public_key === 'string');
+    let signed = false;
+    if (signing && sig.algo === 'ed25519' && typeof sig.value === 'string') {
+      const unsigned = { ...receipt, signature: { algo: sig.algo, key_id: sig.key_id } };
+      try { signed = ed25519.verify(unhex(sig.value), utf8(jcs(unsigned)), unhex(signing.public_key)); }
+      catch { signed = false; }
+    }
+    const received = (receipt?.event_log ?? []).find((e) => e?.type === 'request.received');
+    const checks = {
+      receipt_id_matches: receipt?.receipt_id === receiptId,
+      signed_by_attested_key: signed,
+      body_hash_matches: bodyHash == null ? null : received?.body_hash === bodyHash,
+      model_matches: model == null ? null : receipt?.model === model,
+    };
+    const failed = Object.keys(checks).filter((k) => checks[k] === false);
+    if (failed.length) {
+      const err = new AciError('receipt_invalid', `receipt ${receiptId} failed: ${failed.join(', ')}`);
+      err.checks = checks; err.receipt = receipt;
+      throw err;
+    }
+    return { ok: true, checks, receipt };
   }
 
   /** End this session (call on wallet lock / disconnect). Best-effort. */

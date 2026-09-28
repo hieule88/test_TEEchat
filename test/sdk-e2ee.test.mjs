@@ -13,8 +13,8 @@
 
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { createCipheriv, createDecipheriv, createPublicKey, diffieHellman,
-  generateKeyPairSync, hkdfSync, randomBytes } from 'node:crypto';
+import { createCipheriv, createDecipheriv, createHash, createPublicKey, diffieHellman,
+  generateKeyPairSync, hkdfSync, randomBytes, sign as edSign } from 'node:crypto';
 
 import { LeviathanACI, AciError, jcs } from '../src/leviathan-aci.js';
 
@@ -48,14 +48,24 @@ const REPLY = 'A single red pixel.';
 const REASONING = 'The image is one red pixel; answer briefly.';
 
 /** A fake Edge+gateway: records what it saw, decrypts, answers encrypted. */
-function makeFakeEdge({ applied = true } = {}) {
+function makeFakeEdge({ applied = true, listSigningKey = true } = {}) {
   const service = generateKeyPairSync('x25519');
-  const seen = { rawBody: null, decrypted: [], headers: null };
+  // The gateway's receipt-signing key (ACI §9). Listed in the attestation
+  // report unless a test wants to see an unattested signer rejected.
+  const signer = generateKeyPairSync('ed25519');
+  const seen = { rawBody: null, decrypted: [], headers: null, receipts: {} };
   const fetch = async (url, init = {}) => {
     const u = new URL(url);
     if (u.pathname === '/v1/attestation/report') {
-      return Response.json({ attestation: { workload_keyset: { e2ee_public_keys: [
-        { key_id: 'k1', algo: SUITE, public_key: rawPub(service.publicKey).toString('hex') }] } } });
+      return Response.json({ attestation: { workload_keyset: {
+        e2ee_public_keys: [{ key_id: 'k1', algo: SUITE, public_key: rawPub(service.publicKey).toString('hex') }],
+        receipt_signing_keys: listSigningKey
+          ? [{ key_id: 'r1', algo: 'ed25519', public_key: rawPub(signer.publicKey).toString('hex') }] : [],
+      } } });
+    }
+    if (u.pathname.startsWith('/v1/aci/receipts/')) {
+      const r = seen.receipts[u.pathname.split('/').pop()];
+      return r ? Response.json(r) : Response.json({ error: { type: 'not_found' } }, { status: 404 });
     }
     if (u.pathname === '/v1/chat/completions') {
       seen.rawBody = init.body; seen.headers = init.headers;
@@ -72,6 +82,22 @@ function makeFakeEdge({ applied = true } = {}) {
           });
         }
       });
+      // The receipt commits to the body AFTER decryption: decrypt every
+      // field in place (key order untouched), serialize compactly, hash.
+      // This is the production gateway's behaviour, verified 2026-09-28.
+      const plain = JSON.parse(init.body);
+      for (const d of seen.decrypted) {
+        const path = d.field.split('.'); let o = plain;
+        for (const k of path.slice(0, -1)) o = o[k];
+        o[path[path.length - 1]] = d.text;
+      }
+      const bodyHash = 'sha256:' + createHash('sha256').update(JSON.stringify(plain)).digest('hex');
+      const receiptId = 'rcpt-test';
+      const receipt = { api_version: 1, receipt_id: receiptId, model, served_at: 'now',
+        event_log: [{ seq: 0, type: 'request.received', body_hash: bodyHash }, { seq: 1, type: 'response.returned' }],
+        signature: { algo: 'ed25519', key_id: 'r1' } };
+      receipt.signature.value = edSign(null, Buffer.from(jcs(receipt)), signer.privateKey).toString('hex');
+      seen.receipts[receiptId] = receipt;
       const id = 'chatcmpl-test-1';
       const respAad = (field) => aadOf({ purpose: 'aci.e2ee.response.v2', algo: SUITE, model, id, field, nonce, ts });
       const clientPub = init.headers['x-client-pub-key'];
@@ -199,4 +225,62 @@ test('the service key is fetched once and cached across calls', async () => {
   await aci.chat({ model: 'm', messages: [{ role: 'user', content: 'a' }] });
   await aci.chat({ model: 'm', messages: [{ role: 'user', content: 'b' }] });
   assert.equal(reports, 1);
+});
+
+// ── receipts (ACI §9) ─────────────────────────────────────────────────────
+
+test('verifyReceipt: signature by the attested key AND body_hash of the plaintext we sent (image included)', async () => {
+  const edge = makeFakeEdge();
+  const aci = sdkWithSession(edge.fetch);
+  const model = 'glm-5.3-flash';
+  const r = await aci.chat({ model, messages: [{ role: 'user', content: [
+    { type: 'text', text: 'Image 1 (px.png):' },
+    { type: 'image_url', image_url: { url: IMAGE } },
+    { type: 'text', text: PROMPT },
+  ] }], max_tokens: 500 });
+  assert.match(r.bodyHash, /^sha256:[0-9a-f]{64}$/);
+  const { ok, checks, receipt } = await aci.verifyReceipt(r.receiptId, { bodyHash: r.bodyHash, model });
+  assert.equal(ok, true);
+  assert.deepEqual(checks, { receipt_id_matches: true, signed_by_attested_key: true, body_hash_matches: true, model_matches: true });
+  assert.equal(receipt.event_log[0].body_hash, r.bodyHash, 'the receipt commits to the decrypted body, not the ciphertext');
+  assert.notEqual(r.bodyHash, 'sha256:' + createHash('sha256').update(edge.seen.rawBody).digest('hex'));
+});
+
+test('verifyReceipt: a body hash that is not what we sent fails body_hash_matches, signature still fine', async () => {
+  const edge = makeFakeEdge();
+  const aci = sdkWithSession(edge.fetch);
+  const r = await aci.chat({ model: 'm', messages: [{ role: 'user', content: 'hello' }] });
+  const other = 'sha256:' + createHash('sha256').update('{"model":"m","messages":[{"role":"user","content":"hellp"}]}').digest('hex');
+  await assert.rejects(aci.verifyReceipt(r.receiptId, { bodyHash: other, model: 'm' }), (e) => {
+    assert.equal(e.type, 'receipt_invalid');
+    assert.equal(e.checks.body_hash_matches, false);
+    assert.equal(e.checks.signed_by_attested_key, true);
+    assert.equal(e.checks.model_matches, true);
+    return true;
+  });
+});
+
+test('verifyReceipt: a signer the attestation report does not list is not trusted', async () => {
+  const edge = makeFakeEdge({ listSigningKey: false });
+  const aci = sdkWithSession(edge.fetch);
+  const r = await aci.chat({ model: 'm', messages: [{ role: 'user', content: 'hello' }] });
+  await assert.rejects(aci.verifyReceipt(r.receiptId, { bodyHash: r.bodyHash }), (e) => {
+    assert.equal(e.type, 'receipt_invalid');
+    assert.equal(e.checks.signed_by_attested_key, false);
+    assert.equal(e.checks.body_hash_matches, true);
+    assert.equal(e.checks.model_matches, null, 'a check without its input is null, never a pass');
+    return true;
+  });
+});
+
+test('chat() with e2ee:false returns the same bodyHash a receipt would commit to', async () => {
+  let saw = null;
+  const fetch = async (url, init = {}) => {
+    saw = init.body;
+    return new Response(JSON.stringify({ choices: [{ message: { content: 'plain' } }] }),
+      { status: 200, headers: { 'content-type': 'application/json' } });
+  };
+  const aci = sdkWithSession(fetch);
+  const out = await aci.chat({ model: 'm', messages: [{ role: 'user', content: 'hello' }], e2ee: false });
+  assert.equal(out.bodyHash, 'sha256:' + createHash('sha256').update(saw).digest('hex'));
 });
