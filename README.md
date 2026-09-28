@@ -151,8 +151,18 @@ switch other chat UIs expose.
 `npm test` pins all of this (both caps, PNG-vs-JPEG choice with a fake
 canvas, labels and numbering, budget and placeholders).
 
+**Receipts are verified, not just fetched.** The `verify` button under a
+reply calls `aci.verifyReceipt(receiptId, { bodyHash, model })`: the SDK
+checks the Ed25519 signature against the receipt-signing keys in the
+attestation report and compares the receipt's `body_hash` with the hash of
+the plaintext body this app sent (`chat()` returns it as `bodyHash`; the
+receipt commits to the body *after* the enclave decrypted it, image bytes
+included). Any failed check is shown by name and the reply flagged as
+untrusted.
+
 The end-to-end proof for this path (encrypted image through the Edge,
-decrypted only inside the enclave, correct description back) is
+decrypted only inside the enclave, correct description back, receipt
+signed and committing to that exact body) is
 `leviathan-ai-gateway-verify/example_e2ee_vision.mjs`.
 
 ## On-chain top-up (pay with the wallet itself)

@@ -37,6 +37,7 @@ function explain(e) {
       http_413: 'This conversation is too large to send even without images — start a New chat (the credit was refunded).',
       // Same situation, refused by the Edge itself (by Content-Length, before
       // any debit — so nothing to refund) instead of by the gateway.
+      receipt_invalid: 'The receipt did not verify — signature or body hash mismatch. Do not trust this reply; tell the operator.',
       request_too_large: 'This conversation is too large to send even without images — start a New chat (nothing was charged).',
     };
     return hints[e.type] || `${e.message} (${e.type})`;
@@ -242,7 +243,7 @@ export default function App() {
         outgoing = toSend = stripped.messages;
         result = await send(toSend);
       }
-      const { content, receiptId, raw } = result;
+      const { content, receiptId, bodyHash, raw } = result;
       // Egress disclosure from the gateway: every query the model sent out of
       // the enclave to the search service, verbatim ({query} or {raw}).
       const webSearches = webSearch && Array.isArray(raw?.web_searches)
@@ -262,7 +263,10 @@ export default function App() {
       historyRef.current = [...outgoing, { role: 'assistant', content: content ?? '' }];
       setMessages((m) => {
         const copy = [...m];
-        copy[copy.length - 1] = { role: 'ai', text, receiptId, webSearches };
+        // receiptId + bodyHash + model are what `verify` needs later: the
+        // receipt must be signed by the attested TEE key AND commit to the
+        // hash of the plaintext we sent (image bytes included).
+        copy[copy.length - 1] = { role: 'ai', text, receiptId, bodyHash, model, webSearches };
         return copy;
       });
       aci.refreshBalance().then(sync).catch(() => {});
@@ -436,11 +440,21 @@ export default function App() {
     setMessages([{ role: 'ai', text: 'New conversation — previous context cleared.' }]);
   }, []);
 
-  const verifyReceipt = useCallback(async (id) => {
+  // Not "fetched, therefore fine": the SDK checks the Ed25519 signature
+  // against the attestation report's receipt-signing keys and compares the
+  // receipt's body_hash with the plaintext body this turn sent — so a match
+  // means the enclave decrypted exactly this prompt and this picture.
+  const verifyReceipt = useCallback(async (m) => {
     try {
-      const r = await aci.getReceipt(id);
-      notify('ok', `Receipt verified · TEE-signed · ${r.model ?? ''} · id ${short(id)}`);
-    } catch (e) { notify('err', explain(e)); }
+      const { checks } = await aci.verifyReceipt(m.receiptId, { bodyHash: m.bodyHash ?? null, model: m.model ?? null });
+      const parts = ['signature by attested TEE key ✓'];
+      if (checks.body_hash_matches === true) parts.push('enclave decrypted exactly what you sent (image included) ✓');
+      if (checks.model_matches === true) parts.push(`model ${m.model} ✓`);
+      notify('ok', `Receipt ${short(m.receiptId)} verified · ${parts.join(' · ')}`);
+    } catch (e) {
+      const failed = e?.checks ? Object.keys(e.checks).filter((k) => e.checks[k] === false).join(', ') : '';
+      notify('err', failed ? `Receipt ${short(m.receiptId)} FAILED: ${failed} — do not trust this reply.` : explain(e));
+    }
   }, [notify]);
 
   const inSession = !!session;
@@ -490,7 +504,7 @@ export default function App() {
                 {m.receiptId && (
                   <span className="meta">
                     receipt {short(m.receiptId)}{' '}
-                    <button className="ghost tiny" onClick={() => verifyReceipt(m.receiptId)}>verify</button>
+                    <button className="ghost tiny" onClick={() => verifyReceipt(m)}>verify</button>
                   </span>
                 )}
               </div>
