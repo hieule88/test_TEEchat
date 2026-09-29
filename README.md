@@ -124,10 +124,14 @@ the gateway's 32 MiB cap (413). Hence:
   way multi-image prompting guides recommend. The user can say "compare
   image 1 and 2", and the placeholder below uses the same name.
 - **Context budget**: before each send the estimated encrypted size of the
-  conversation is held under 8 MiB by replacing the *oldest* images with a
+  conversation is held under 12 MiB by replacing the *oldest* images with a
   text placeholder (`[Image 1 (receipt.png) sent earlier]`, the label part
-  is dropped with it); the newest image always stays so follow-up questions
-  about it work. The user is told when an image leaves the context, and the
+  is dropped with it). The **two newest images always stay**, whatever their
+  size, so "compare image 1 and 2" works even for two 2 MB PNG screenshots
+  (≈ 11 MB once hex-encoded — that is why the budget is 12 MiB, not 8); only
+  above a 24 MiB hard cap (the gateway refuses 32 MiB) does it fall back to
+  the newest one. Ordinary JPEG photos (~1.3 MB hex each) keep 8–9 in
+  context. The user is told when an image leaves the context, and the
   trimmed history is what gets kept. Numbering keeps counting past retired
   images.
 - **413 anyway** (an odd image, a huge text history): the app drops the

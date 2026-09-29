@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import {
-  CONTEXT_BUDGET_BYTES, MAX_ENCODED_BYTES, MAX_PIXELS, MAX_SIDE_PX, dataUrlBytes, estimateEncryptedBytes,
+  CONTEXT_BUDGET_BYTES, CONTEXT_HARD_CAP_BYTES, MAX_ENCODED_BYTES, MAX_PIXELS, MAX_SIDE_PX, dataUrlBytes, estimateEncryptedBytes,
   fitWithin, imageLabel, imageTurnContent, nextImageNumber, outgoingFor, prepareImage, stripAllImages,
   stripHistoryImages, toWire, trimImageContext,
 } from '../src/vision.js';
@@ -66,15 +66,16 @@ test('nextImageNumber keeps counting across images already trimmed to placeholde
   assert.equal(nextImageNumber([{ role: 'user', content: 'hi' }, reply()]), 1);
   const two = [imgTurn(1, 'a', 3 * MB), reply(), imgTurn(2, 'b', 3 * MB)];
   assert.equal(nextImageNumber(two), 3);
-  const { messages } = trimImageContext(two, { budgetBytes: 7 * MB });   // drops image 1
+  const { messages } = trimImageContext(two, { budgetBytes: 7 * MB, hardCapBytes: 7 * MB });   // drops image 1
   assert.equal(nextImageNumber(messages), 3, 'a retired image keeps its number');
 });
 
 // ── the budget ───────────────────────────────────────────────────────────
 
-test('trimImageContext drops the OLDEST images first and always keeps the newest', () => {
-  const msgs = [imgTurn(1, 'one.jpg', 2.5 * MB), reply(), imgTurn(2, 'two.jpg', 2.5 * MB), reply(), imgTurn(3, 'three.jpg', 2.5 * MB)];
-  // 3 × ~6.7 MB ≈ 20 MB estimated → over the 8 MiB budget; one image fits
+test('trimImageContext drops the OLDEST images first and keeps the two newest', () => {
+  const msgs = [imgTurn(1, 'one.jpg', 2 * MB), reply(), imgTurn(2, 'two.jpg', 2 * MB), reply(),
+    imgTurn(3, 'three.jpg', 2 * MB), reply(), imgTurn(4, 'four.jpg', 2 * MB)];
+  // 4 maximum-size images ≈ 4 × 5.6 MB = 22 MB estimated → over the 12 MiB budget; two fit
   const { messages, dropped } = trimImageContext(msgs);
   assert.deepEqual(dropped, ['Image 1 (one.jpg)', 'Image 2 (two.jpg)']);
   // the label part is gone and the image part became a same-named placeholder; the question stays
@@ -83,16 +84,42 @@ test('trimImageContext drops the OLDEST images first and always keeps the newest
     { type: 'text', text: 'look' },
   ]);
   assert.equal(messages[2].content[0].text, '[Image 2 (two.jpg) sent earlier]');
-  assert.equal(messages[4].content[1].type, 'image_url', 'the newest image survives');
-  assert.equal(messages[4].content[0].text, 'Image 3 (three.jpg):', 'its label survives with it');
+  assert.equal(messages[4].content[1].type, 'image_url', 'the second-newest image survives');
+  assert.equal(messages[6].content[1].type, 'image_url', 'the newest image survives');
+  assert.equal(messages[6].content[0].text, 'Image 4 (four.jpg):', 'its label survives with it');
   assert.ok(estimateEncryptedBytes(messages) <= CONTEXT_BUDGET_BYTES);
   // the input is untouched (pure)
   assert.equal(msgs[0].content[1].type, 'image_url');
   assert.equal(msgs[0].content.length, 3);
 });
 
+test('two maximum-size images (2 MiB PNG screenshots) both stay: "compare image 1 and 2" always works', () => {
+  const two = [imgTurn(1, 'a.png', MAX_ENCODED_BYTES), reply(), imgTurn(2, 'b.png', MAX_ENCODED_BYTES)];
+  assert.ok(estimateEncryptedBytes(two) > 8 * MB, 'the reviewer\'s case: over the old 8 MiB budget');
+  const { messages, dropped } = trimImageContext(two);
+  assert.deepEqual(dropped, []);
+  assert.equal(messages, two);
+  // a third one pushes only the first out
+  const three = [...two, reply(), imgTurn(3, 'c.png', MAX_ENCODED_BYTES)];
+  const out = trimImageContext(three);
+  assert.deepEqual(out.dropped, ['Image 1 (a.png)']);
+  assert.equal(out.messages[2].content[1].type, 'image_url');
+  assert.equal(out.messages[4].content[1].type, 'image_url');
+});
+
+test('the two protected images yield to the hard cap, down to the single newest', () => {
+  // hypothetical: two images so large that together they exceed what the gateway takes
+  const huge = [imgTurn(1, 'x', 10 * MB), reply(), imgTurn(2, 'y', 10 * MB)];
+  const { messages, dropped } = trimImageContext(huge, { hardCapBytes: CONTEXT_HARD_CAP_BYTES });
+  assert.deepEqual(dropped, ['Image 1 (x)']);
+  assert.equal(messages[2].content[1].type, 'image_url');
+  // and a lone image is never dropped, even over the hard cap
+  const lone = trimImageContext([imgTurn(1, 'z', 20 * MB)]);
+  assert.deepEqual(lone.dropped, []);
+});
+
 test('trimImageContext keeps the newest image even when it alone exceeds the budget', () => {
-  const { messages, dropped } = trimImageContext([imgTurn(1, 'only.jpg', 6 * MB)], { budgetBytes: 1 * MB });
+  const { messages, dropped } = trimImageContext([imgTurn(1, 'only.jpg', 6 * MB)], { budgetBytes: 1 * MB, hardCapBytes: 1 * MB });
   assert.deepEqual(dropped, []);
   assert.equal(messages[0].content[1].type, 'image_url');
 });
@@ -113,7 +140,7 @@ test('trimImageContext is idempotent on its own output (dropped images stay drop
 
 test('trimImageContext still handles an unlabelled image part (no _n)', () => {
   const legacy = { role: 'user', content: [{ type: 'text', text: 'q' }, { type: 'image_url', image_url: { url: fakeDataUrl(3 * MB) }, _name: 'old.jpg' }] };
-  const { messages, dropped } = trimImageContext([legacy, reply(), imgTurn(1, 'new.jpg', 3 * MB)], { budgetBytes: 7 * MB });
+  const { messages, dropped } = trimImageContext([legacy, reply(), imgTurn(1, 'new.jpg', 3 * MB)], { budgetBytes: 7 * MB, hardCapBytes: 7 * MB });
   assert.deepEqual(dropped, ['image old.jpg']);
   assert.deepEqual(messages[0].content[1], { type: 'text', text: '[image old.jpg sent earlier]' });
 });

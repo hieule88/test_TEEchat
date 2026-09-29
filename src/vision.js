@@ -31,7 +31,15 @@ export const JPEG_QUALITY = 0.85;
 export const MAX_SOURCE_BYTES = 6 * 1024 * 1024;   // what we accept from the picker (camera photos)
 export const MAX_ENCODED_BYTES = 2 * 1024 * 1024;  // what we accept AFTER resizing — more is abnormal
 export const KEEP_ORIGINAL_MAX_BYTES = 1024 * 1024; // lossy source small enough: send as-is
-export const CONTEXT_BUDGET_BYTES = 8 * 1024 * 1024; // estimated ENCRYPTED size of all images in context
+// Context budget for images, as ESTIMATED ENCRYPTED bytes (hex doubles them).
+// 12 MiB holds two maximum-size images (2 MiB encoded → ~5.6 MB hex each)
+// plus text — so "compare image 1 and 2" is always possible — and 8–9
+// ordinary JPEG photos. The two newest images are never dropped below the
+// HARD cap (the gateway refuses 32 MiB bodies; 24 MiB leaves room for text),
+// however large; the budget only decides how many OLDER images stay.
+export const CONTEXT_BUDGET_BYTES = 12 * 1024 * 1024;
+export const CONTEXT_HARD_CAP_BYTES = 24 * 1024 * 1024;
+export const KEEP_NEWEST_IMAGES = 2;
 
 // Lossless sources (screenshots, diagrams, UI captures — anything with text)
 // stay lossless after the resize as long as they fit MAX_ENCODED_BYTES: JPEG
@@ -232,21 +240,29 @@ function retireImage(messages, mi, ci) {
 /**
  * Keep the conversation under `budgetBytes` (estimated encrypted size) by
  * replacing the OLDEST image parts with a text placeholder, one at a time.
- * The newest image is never dropped: the user may be asking about it.
- * Pure — returns new arrays; the caller decides whether to persist them.
+ * The `keepNewest` most recent images survive the budget whatever their
+ * size — the user may be comparing them — unless even that exceeds
+ * `hardCapBytes` (what the gateway would refuse), in which case only the
+ * newest one is kept. Pure — returns new arrays; the caller decides whether
+ * to persist them.
  *
  * @returns {{ messages: object[], dropped: string[] }}  dropped = labels, oldest first
  */
-export function trimImageContext(messages, { budgetBytes = CONTEXT_BUDGET_BYTES } = {}) {
+export function trimImageContext(messages, {
+  budgetBytes = CONTEXT_BUDGET_BYTES, hardCapBytes = CONTEXT_HARD_CAP_BYTES, keepNewest = KEEP_NEWEST_IMAGES,
+} = {}) {
   let current = messages;
   const dropped = [];
-  let images = imageParts(current);
-  while (images.length > 1 && estimateEncryptedBytes(current) > budgetBytes) {
-    const oldest = images[0];
+  const over = (limit) => estimateEncryptedBytes(current) > limit;
+  const retireOldest = () => {
+    const oldest = imageParts(current)[0];
     current = retireImage(current, oldest.mi, oldest.ci);
     dropped.push(oldest.label);
-    images = imageParts(current);
-  }
+  };
+  // 1. the budget governs the OLDER images only
+  while (imageParts(current).length > keepNewest && over(budgetBytes)) retireOldest();
+  // 2. the hard cap governs the protected ones, down to the single newest
+  while (imageParts(current).length > 1 && over(hardCapBytes)) retireOldest();
   return { messages: current, dropped };
 }
 
